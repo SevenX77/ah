@@ -14,9 +14,38 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/SevenX77/ah/releases/la
 
 This installs both `ah` and `ahd`. Release archives and checksums are on the [Releases page](https://github.com/SevenX77/ah/releases).
 
-> `ah` is Linux-only: it relies on pidfd process supervision, tmux, and systemd.
-
 That is all you need — see [Quick Start](#quick-start) below. (Building from source is only relevant if you want to contribute; see [Development](#development).)
+
+### Requirements
+
+| Dependency | Why | Check |
+|---|---|---|
+| Linux x86_64 — native, or **Windows via WSL2** (see below) | `ah` supervises processes with Linux pidfd and manages lifecycles with systemd | `uname -m` → `x86_64` |
+| `tmux` | every agent runs in its own tmux-backed workspace | `tmux -V` |
+| systemd with a user session | agent process trees run in systemd user scopes, so crashed daemons never leak orphans | `systemctl --user is-system-running` |
+| The provider CLIs you configure | `ah` orchestrates them, it does not bundle them — install and log in to `claude` / `codex` / `antigravity` yourself first | e.g. `claude --version` |
+
+macOS is not supported yet; native support (kqueue-based supervision) is on the roadmap.
+
+### Windows (WSL2)
+
+`ah` runs fully supported inside WSL2 — that is a real Linux environment, so everything above applies unchanged. Setup once:
+
+1. In PowerShell (admin): `wsl --install`, then reboot. This installs WSL2 with Ubuntu.
+2. Open Ubuntu and confirm systemd is active: `systemctl --user is-system-running`. On WSL installs from before 2023 it may be off — enable it by adding to `/etc/wsl.conf`:
+   ```ini
+   [boot]
+   systemd=true
+   ```
+   then run `wsl --shutdown` in PowerShell and reopen Ubuntu.
+3. Install tmux if missing: `sudo apt install -y tmux`.
+4. Install your agent CLIs (claude/codex/…) **inside WSL** and log in there — agents live in the Linux world, not on the Windows side.
+5. Run the one-line `ah` installer above, inside WSL.
+
+Practical notes:
+
+- Keep your projects in the WSL filesystem (e.g. `~/projects/...`), not under `/mnt/c/...` — cross-boundary file IO is much slower.
+- Everything `ah` owns (daemon socket, tmux panes, state) lives inside WSL. Drive it from a WSL shell; from the Windows side you can shell through with `wsl -e ah ps` etc.
 
 ## Quick Start
 
