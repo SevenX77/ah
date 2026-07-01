@@ -1,0 +1,13 @@
+version = "1"
+
+[env]
+PROJECT_ROOT = "/tmp/ccbd-example"
+
+[agents.a1]
+provider = "bash"
+
+[agents.a2]
+provider = "bash"
+
+[agents.review]
+provider = "bash"

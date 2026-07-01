@@ -1,0 +1,21 @@
+# ah.toml — this repository's own ah configuration.
+# Also serves as a test fixture: state-layout tests assert a repo-root ah.toml exists.
+version = "1"
+
+[master]
+cmd = "claude"
+enabled = true
+
+[completion]
+hook_push_enabled = true
+hook_push_events = ["stop"]
+hook_push_providers = ["claude", "codex", "antigravity"]
+
+[agents.a1]
+provider = "codex"
+
+[agents.a2]
+provider = "antigravity"
+
+[agents.a3]
+provider = "claude"
