@@ -16,15 +16,9 @@ This installs both `ah` and `ahd`. Release archives and checksums are on the [Re
 
 > `ah` is Linux-only: it relies on pidfd process supervision, tmux, and systemd.
 
-Alternatively, install from source with Cargo:
+That is all you need — see [Quick Start](#quick-start) below. (Building from source is only relevant if you want to contribute; see [Development](#development).)
 
-```bash
-cargo install --git https://github.com/SevenX77/ah --bin ah --bin ahd
-```
-
-Or build from a checkout with `cargo build --release`; the binaries are written to `target/release/ah` and `target/release/ahd`.
-
-## Minimal Project
+## Quick Start
 
 Create `ah.toml` in a project directory:
 
@@ -267,6 +261,22 @@ Inside that directory you will find `ahd.sqlite` (jobs, sessions, recovery state
 
 With no `ah.toml` found by walking up and no override set, ah falls back to `~/.local/state/ah/default/`.
 
+## Development
+
+Only needed if you are working on ah itself (end users should use the
+prebuilt installer above). With a Rust toolchain:
+
+```bash
+cargo build --release   # binaries land in target/release/{ah,ahd}
+cargo test              # full test suite
+```
+
+Or install straight from source:
+
+```bash
+cargo install --git https://github.com/SevenX77/ah --bin ah --bin ahd
+```
+
 ## License
 
-TBD.
+MIT — see [LICENSE](LICENSE).
