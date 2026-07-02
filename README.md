@@ -75,6 +75,22 @@ ah --config ./ah.toml start --wait
 
 `ahd` can also be run directly, but the normal entry point is `ah start` because it performs daemon bootstrap and then drives the project config.
 
+### Everything runs in the background
+
+After `ah start` returns, you will not see any new window or UI — that is expected. The daemon runs as a systemd user service, and the master and every agent run detached inside a dedicated tmux server. Your terminal stays yours; the agents are long-lived and keep working without it.
+
+To open the master's interactive screen and talk to it directly:
+
+```bash
+ah attach master
+```
+
+Your terminal switches into the live master session (e.g. a running `claude` UI) — type to converse as usual. To leave without stopping anything, press `Ctrl-b` then `d` (tmux detach); the master keeps running in the background.
+
+Workers can be inspected the same way (`ah attach agent a1`), but prefer watching over typing — keystrokes land in the agent's input and can disturb a busy agent. The supported way to interact with workers is `ah ask` from your own shell.
+
+You never have to attach at all: `ah ask` / `ah ps` / `ah watch` / `ah logs` drive and observe everything from the outside.
+
 ## CLI
 
 Implemented top-level commands:
