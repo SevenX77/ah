@@ -4,6 +4,8 @@
 
 Use it when you want one project-level control plane to coordinate provider agents such as Codex, Claude, Antigravity, or an explicit shell provider.
 
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## Install
 
 One-line install (Linux x86_64, prebuilt binaries — no Rust toolchain needed):
