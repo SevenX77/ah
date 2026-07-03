@@ -16,6 +16,7 @@ use crate::marker::{
 };
 use crate::monitor;
 use crate::monitor::agent_watch::spawn_agent_pidfd_watch_task;
+use crate::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{
     HomeLayoutRole, HookPushContext, prepare_home_layout_with_extensions_for_slot,
@@ -111,6 +112,14 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         .ok_or_else(|| {
             CcbdError::DbConstraintViolation(format!("session not found: {session_id}"))
         })?;
+    let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
+    let resolved_bundles = resolve_bundles_for_provider(
+        &agent_cwd,
+        manifest.provider_name,
+        BundleRole::Worker,
+        &extensions,
+    )?;
+    let extensions = resolved_bundles.extensions;
 
     let sandbox_guard = if ctx.env_state.unsafe_no_sandbox {
         None
@@ -121,7 +130,6 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             agent_id,
         )?))
     };
-    let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
     let mut spawn_env_vars =
         build_agent_spawn_env_vars_for_hook_push(&ctx.state_dir, extra_env_vars);
     let hook_push_enabled = hook_push_enabled_from_spawn_params(&params);
@@ -273,6 +281,8 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         },
         hooks: &extensions.hooks,
         plugins: &extensions.plugins,
+        skills: &extensions.skills,
+        bundle: extensions.bundle_digest.as_ref(),
     })?;
     let spawn_spec = crate::db::recovery::AgentSpawnSpec {
         agent_id: agent_id.to_string(),
@@ -280,6 +290,9 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         env: spawn_env_vars.clone(),
         hooks: extensions.hooks.clone(),
         plugins: extensions.plugins.clone(),
+        skills: extensions.skills.clone(),
+        bundle: extensions.bundle.clone(),
+        bundle_digest: extensions.bundle_digest.clone(),
         sandbox_overrides: sandbox_overrides.clone(),
         hook_push_enabled,
     };
@@ -414,6 +427,9 @@ mod ra2_tests {
             env: HashMap::from([("RA2_ENV".to_string(), "1".to_string())]),
             hooks: HashMap::<String, Vec<HookGroup>>::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            skills: Vec::new(),
+            bundle: Vec::new(),
+            bundle_digest: None,
             sandbox_overrides: Default::default(),
             hook_push_enabled: false,
         }
@@ -563,6 +579,7 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     let provider = params
         .get("provider")
         .and_then(Value::as_str)
+        .map(crate::provider::manifest::canonicalize_provider_name)
         .map(str::to_string);
     let event_id = params
         .get("event_id")
@@ -586,6 +603,14 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
     }
     let provider = provider.unwrap_or(agent.provider);
 
+    tracing::info!(
+        agent_id = %agent_id,
+        provider = %provider,
+        event = %event,
+        event_id = ?event_id,
+        "received agent.notify hook"
+    );
+
     let (changes, affected_job_id) = mark_agent_idle_hook_event(
         ctx.db.clone(),
         agent_id.clone(),
@@ -595,6 +620,12 @@ pub async fn handle_agent_notify(params: Value, ctx: &Ctx) -> Result<Value, Ccbd
         reply,
     )
     .await?;
+    tracing::info!(
+        changes,
+        affected_job_id = ?affected_job_id,
+        transitioned = changes > 0,
+        "processed agent.notify hook"
+    );
     if changes > 0 {
         if let Some(job_id) = &affected_job_id {
             crate::orchestrator::pubsub::notify_job_update(job_id);

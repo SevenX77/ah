@@ -12,6 +12,8 @@ use crate::master_revival::{
     MasterTransitionOutcome, master_spawn_lock, query_master_runtime, try_claim_master_transition,
 };
 use crate::monitor::session_watch::unit_name_for_session;
+use crate::provider::bundles::{BundleRole, digest_for_bundles};
+use crate::provider::fingerprint::BundleDigest;
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::rpc::Ctx;
 use crate::sandbox::SandboxOverrides;
@@ -27,6 +29,12 @@ struct RealignMasterParams {
     hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
     plugins: Vec<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
+    bundle: Vec<String>,
+    #[serde(default)]
+    bundle_digest: Option<BundleDigest>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -39,6 +47,12 @@ pub(crate) struct RealignAgentParams {
     pub(crate) hooks: HashMap<String, Vec<crate::provider::extensions::HookGroup>>,
     #[serde(default)]
     pub(crate) plugins: Vec<String>,
+    #[serde(default)]
+    pub(crate) skills: Vec<String>,
+    #[serde(default)]
+    pub(crate) bundle: Vec<String>,
+    #[serde(default)]
+    pub(crate) bundle_digest: Option<BundleDigest>,
     #[serde(default)]
     pub(crate) sandbox_overrides: SandboxOverrides,
     #[serde(default)]
@@ -53,18 +67,36 @@ struct RunningAgentConfigHash {
     config_hash: Option<String>,
 }
 
+fn populate_bundle_digests(
+    project_root: &std::path::Path,
+    master: &mut RealignMasterParams,
+    agents: &mut [RealignAgentParams],
+) -> Result<(), CcbdError> {
+    if master.bundle_digest.is_none() {
+        master.bundle_digest =
+            digest_for_bundles(project_root, BundleRole::Master, &master.bundle)?;
+    }
+    for agent in agents {
+        if agent.bundle_digest.is_none() {
+            agent.bundle_digest =
+                digest_for_bundles(project_root, BundleRole::Worker, &agent.bundle)?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, CcbdError> {
     let session_id = required_str(&params, "session_id")?.to_string();
     let force = optional_bool(&params, "force", false)?;
     let skip_master = optional_bool(&params, "_skip_master", false)?;
-    let master: RealignMasterParams = serde_json::from_value(
+    let mut master: RealignMasterParams = serde_json::from_value(
         params
             .get("master")
             .cloned()
             .ok_or_else(|| CcbdError::IpcInvalidRequest("missing field 'master'".into()))?,
     )
     .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid master: {err}")))?;
-    let agents: Vec<RealignAgentParams> = serde_json::from_value(
+    let mut agents: Vec<RealignAgentParams> = serde_json::from_value(
         params
             .get("agents")
             .cloned()
@@ -75,6 +107,8 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
     let session = query_session_by_id(ctx.db.clone(), session_id.clone())
         .await?
         .ok_or_else(|| CcbdError::IpcInvalidRequest(format!("session not found: {session_id}")))?;
+    let project_root = std::path::PathBuf::from(&session.absolute_path);
+    populate_bundle_digests(&project_root, &mut master, &mut agents)?;
     let mut results = Vec::new();
     if skip_master {
         results.push(json!({
@@ -88,6 +122,8 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 role: ConfigRole::Master { cmd: &master.cmd },
                 hooks: &master.hooks,
                 plugins: &master.plugins,
+                skills: &master.skills,
+                bundle: master.bundle_digest.as_ref(),
             })?
             .as_str(),
         )
@@ -102,6 +138,8 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             role: ConfigRole::Master { cmd: &master.cmd },
             hooks: &master.hooks,
             plugins: &master.plugins,
+            skills: &master.skills,
+            bundle: master.bundle_digest.as_ref(),
         })?;
         let spawn_lock = master_spawn_lock(&session_id);
         let _master_spawn_guard = spawn_lock.lock().await;
@@ -129,6 +167,8 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
                 "cmd": master.cmd.clone(),
                 "hooks": master.hooks.clone(),
                 "plugins": master.plugins.clone(),
+                "skills": master.skills.clone(),
+                "bundle": master.bundle.clone(),
                 "_claimed_master_generation": claimed_generation,
             }),
             ctx,
@@ -164,6 +204,8 @@ pub async fn handle_session_realign(params: Value, ctx: &Ctx) -> Result<Value, C
             },
             hooks: &agent.hooks,
             plugins: &agent.plugins,
+            skills: &agent.skills,
+            bundle: agent.bundle_digest.as_ref(),
         })?;
         let Some(running) = running_agents
             .iter()
@@ -305,8 +347,11 @@ pub async fn handle_agent_realign(params: Value, ctx: &Ctx) -> Result<Value, Ccb
             "master": {
                 "cmd": "",
                 "hooks": {},
-                "plugins": [],
-            },
+            "plugins": [],
+            "skills": [],
+            "bundle": [],
+            "bundle_digest": null,
+        },
             "agents": [agent],
         }),
         ctx,
@@ -340,6 +385,9 @@ pub(crate) async fn spawn_realign_agent(
             "extra_env_vars": agent.env.clone(),
             "hooks": agent.hooks.clone(),
             "plugins": agent.plugins.clone(),
+            "skills": agent.skills.clone(),
+            "bundle": agent.bundle.clone(),
+            "bundle_digest": agent.bundle_digest.clone(),
             "sandbox_overrides": agent.sandbox_overrides.clone(),
             "hook_push_enabled": agent.hook_push_enabled,
         }),
@@ -393,6 +441,9 @@ async fn persist_realign_snapshot_after_success(
         env: agent.env.clone(),
         hooks: agent.hooks.clone(),
         plugins: agent.plugins.clone(),
+        skills: agent.skills.clone(),
+        bundle: agent.bundle.clone(),
+        bundle_digest: agent.bundle_digest.clone(),
         sandbox_overrides: agent.sandbox_overrides.clone(),
         hook_push_enabled: agent.hook_push_enabled,
     };
@@ -449,6 +500,9 @@ mod ra2_tests {
             env: HashMap::from([("AFTER_REALIGN".to_string(), "1".to_string())]),
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            skills: Vec::new(),
+            bundle: Vec::new(),
+            bundle_digest: None,
             sandbox_overrides: crate::sandbox::SandboxOverrides {
                 extra_ro_binds: vec![crate::sandbox::ReadOnlyBind {
                     host_path: "/opt/realign".to_string(),
@@ -516,6 +570,10 @@ fn drift_reason(running: &RunningAgentConfigHash, expected: &RealignAgentParams)
         "provider changed"
     } else if !expected.plugins.is_empty() {
         "plugins changed"
+    } else if !expected.skills.is_empty() {
+        "skills changed"
+    } else if expected.bundle_digest.is_some() {
+        "bundle changed"
     } else if !expected.hooks.is_empty() {
         "hooks changed"
     } else if !expected.env.is_empty() {

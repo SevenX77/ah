@@ -34,7 +34,40 @@ pub(super) fn extension_config_from_params(params: &Value) -> Result<ExtensionCo
                 .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid plugins: {err}")))?,
             None => Default::default(),
         },
+        skills: match params.get("skills") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid skills: {err}")))?,
+            None => Default::default(),
+        },
+        bundle: match params.get("bundle") {
+            Some(value) => parse_bundle_refs(value.clone())?,
+            None => Default::default(),
+        },
+        mcp: match params.get("mcp") {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid mcp: {err}")))?,
+            None => Default::default(),
+        },
+        rules: Default::default(),
+        bundle_digest: Default::default(),
+        resolved_skills: Default::default(),
     })
+}
+
+fn parse_bundle_refs(value: Value) -> Result<Vec<String>, CcbdError> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BundleInput {
+        Single(String),
+        Many(Vec<String>),
+    }
+
+    match serde_json::from_value(value)
+        .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid bundle: {err}")))?
+    {
+        BundleInput::Single(value) => Ok(vec![value]),
+        BundleInput::Many(values) => Ok(values),
+    }
 }
 
 pub(super) fn optional_bool(params: &Value, field: &str, default: bool) -> Result<bool, CcbdError> {

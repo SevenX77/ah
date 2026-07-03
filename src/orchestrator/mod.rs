@@ -509,6 +509,9 @@ async fn recover_crashed_agent_from_snapshot_with_respawn_and_intent(
         env: stored.spec.env.clone(),
         hooks: stored.spec.hooks.clone(),
         plugins: stored.spec.plugins.clone(),
+        skills: stored.spec.skills.clone(),
+        bundle: stored.spec.bundle.clone(),
+        bundle_digest: stored.spec.bundle_digest.clone(),
         sandbox_overrides: stored.spec.sandbox_overrides.clone(),
         hook_push_enabled: stored.spec.hook_push_enabled,
     };
@@ -1059,7 +1062,17 @@ fn prepare_log_monitor_before_send(
         }
     };
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let cursor_count = cursors.len();
+    let file_list_count = cursor_count;
     let initial_state = crate::completion::reader::LogReadState::from_cursors(cursors);
+    tracing::info!(
+        agent_id,
+        provider,
+        root = %root.display(),
+        cursor_count,
+        file_list_count,
+        "registered provider completion log monitor"
+    );
     crate::completion::registry::register(
         agent_id.to_string(),
         crate::completion::registry::LogMonitorEntry {
@@ -1295,6 +1308,9 @@ mod tests {
             env: HashMap::from([("FOO".to_string(), "bar".to_string())]),
             hooks: HashMap::new(),
             plugins: vec!["github@openai-curated".to_string()],
+            skills: Vec::new(),
+            bundle: Vec::new(),
+            bundle_digest: None,
             sandbox_overrides: Default::default(),
             hook_push_enabled: false,
         }
@@ -1402,6 +1418,9 @@ mod tests {
                     env: agent.env.clone(),
                     hooks: agent.hooks.clone(),
                     plugins: agent.plugins.clone(),
+                    skills: agent.skills.clone(),
+                    bundle: agent.bundle.clone(),
+                    bundle_digest: agent.bundle_digest.clone(),
                     sandbox_overrides: agent.sandbox_overrides.clone(),
                     hook_push_enabled: agent.hook_push_enabled,
                 },

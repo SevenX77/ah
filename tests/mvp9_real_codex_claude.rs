@@ -1,11 +1,13 @@
+#![cfg(target_os = "linux")]
 use ah::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
 use ah::cli::rpc_client::{CliError, RpcClient, RpcFuture};
 use ah::cli::start::start_project;
 use ah::db;
 use ah::rpc::Ctx;
 use ah::rpc::handlers::{
-    handle_agent_spawn, handle_job_submit, handle_job_wait, handle_session_create,
-    handle_session_kill, handle_session_spawn_master_pane,
+    handle_agent_spawn, handle_agent_watch, handle_job_submit, handle_job_wait,
+    handle_session_create, handle_session_kill, handle_session_list,
+    handle_session_spawn_master_pane,
 };
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxServer, compute_socket_name};
@@ -74,6 +76,9 @@ impl RpcClient for HandlerClient {
     fn call<'a>(&'a self, method: &'a str, params: Value) -> RpcFuture<'a> {
         Box::pin(async move {
             match method {
+                "session.list" => handle_session_list(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
                 "session.create" => {
                     let result = handle_session_create(params, &self.ctx)
                         .await
@@ -84,6 +89,9 @@ impl RpcClient for HandlerClient {
                     Ok(result)
                 }
                 "agent.spawn" => handle_agent_spawn(params, &self.ctx)
+                    .await
+                    .map_err(map_rpc_error),
+                "agent.watch" => handle_agent_watch(params, &self.ctx)
                     .await
                     .map_err(map_rpc_error),
                 "session.spawn_master_pane" => handle_session_spawn_master_pane(params, &self.ctx)
@@ -114,6 +122,8 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             env: HashMap::new(),
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
+            bundle: Default::default(),
         },
     );
     agents.insert(
@@ -123,6 +133,8 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             env: HashMap::new(),
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
+            bundle: Default::default(),
         },
     );
     let config = ProjectConfig {
@@ -134,6 +146,8 @@ async fn test_launcher_config_parse_and_batch_spawn_real() {
             enabled: false,
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
+            bundle: Default::default(),
         },
         completion: Default::default(),
         daemon: Default::default(),

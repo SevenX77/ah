@@ -1,7 +1,13 @@
 use crate::error::CcbdError;
 use crate::provider::builtin;
-use crate::provider::extensions::{ExtensionConfig, HookGroup, HookItem};
+use crate::provider::extensions::{
+    ExtensionConfig, HookGroup, HookItem, McpServerConfig, McpTransport,
+};
 use crate::provider::plugins::{ResolvedPlugin, resolve_plugins_for_provider};
+use crate::provider::skills::{
+    ResolvedSkill, parse_skill_refs, plan_claude_skill_materialization,
+    plan_codex_skill_materialization, resolve_project_skills,
+};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -143,7 +149,6 @@ pub fn prepare_home_layout_with_extensions_for_slot(
     let workspace_key = workspace_trust_key(workspace_path);
     fs::create_dir_all(&home_root)
         .map_err(|err| home_err("create sandbox home", &home_root, err))?;
-
     let overrides = match provider {
         "claude" => prepare_claude_overrides(
             &source_home,
@@ -172,12 +177,16 @@ pub fn prepare_home_layout_with_extensions_for_slot(
             workspace_path,
             role,
             slot_id,
+            &extensions,
             hook_push_ctx,
         ),
-        _ => Ok(HomeOverrides {
-            home_root,
-            extra_env: HashMap::new(),
-        }),
+        _ => {
+            materialize_unwired_provider_skills(provider, &extensions.skills)?;
+            Ok(HomeOverrides {
+                home_root,
+                extra_env: HashMap::new(),
+            })
+        }
     }?;
     materialize_sandbox_home_links(&source_home, &overrides.home_root);
     Ok(overrides)
@@ -200,14 +209,25 @@ fn prepare_claude_overrides(
         .map_err(|err| home_err("create claude projects", &layout.projects_root, err))?;
     fs::create_dir_all(&layout.session_env_root)
         .map_err(|err| home_err("create claude session env", &layout.session_env_root, err))?;
-    materialize_builtin_rules(role, "claude", home_root, project_root, slot_id)?;
+    materialize_builtin_rules(
+        role,
+        "claude",
+        home_root,
+        project_root,
+        slot_id,
+        &extensions.rules,
+    )?;
     materialize_trust(source_home, &layout, workspace_key)?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
+    materialize_claude_skills(&layout, &skills)?;
     let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
     materialize_claude_plugins(&layout, &plugins)?;
     let mut hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "claude") {
         hook_specs.push(materialized_ah_hook(ctx, "Stop"));
     }
+    materialize_claude_mcp(&layout, workspace_key, &extensions.mcp)?;
     materialize_claude_settings(source_home, &layout, &hook_specs, &plugins)?;
     link_credentials(source_home, &layout);
 
@@ -235,7 +255,7 @@ fn prepare_codex_overrides(
         project_root,
         role,
         slot_id,
-        &extensions.plugins,
+        extensions,
         hook_push_ctx,
     )?;
     Ok(HomeOverrides {
@@ -251,6 +271,7 @@ fn prepare_antigravity_overrides(
     project_root: &Path,
     role: HomeLayoutRole,
     slot_id: &str,
+    extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = AntigravityHomeLayout::for_home(home_root);
@@ -261,14 +282,35 @@ fn prepare_antigravity_overrides(
             err,
         )
     })?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
+    materialize_antigravity_skills(&layout, &skills)?;
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
-    materialize_builtin_rules(role, "antigravity", home_root, project_root, slot_id)?;
+    materialize_builtin_rules(
+        role,
+        "antigravity",
+        home_root,
+        project_root,
+        slot_id,
+        &extensions.rules,
+    )?;
+    let hook_specs = materialize_hooks(
+        source_home,
+        &layout.hooks_path.with_file_name("hooks"),
+        &extensions.hooks,
+    )?;
+    if !hook_specs.is_empty() {
+        merge_antigravity_hooks(source_home, &layout, &hook_specs)?;
+    }
     if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "antigravity") {
         materialize_antigravity_hooks(source_home, &layout, ctx)?;
+    }
+    if !hook_specs.is_empty() || active_hook_push_ctx(hook_push_ctx, "antigravity").is_some() {
         materialize_antigravity_json_hooks_gate(&layout)?;
     }
+    materialize_antigravity_mcp(&layout, &extensions.mcp)?;
 
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
@@ -276,10 +318,9 @@ fn prepare_antigravity_overrides(
     })
 }
 
-fn materialize_antigravity_hooks(
+fn copy_antigravity_hooks_if_missing(
     source_home: &Path,
     layout: &AntigravityHomeLayout,
-    ctx: &HookPushContext,
 ) -> Result<(), CcbdError> {
     let source_hooks = source_home.join(".gemini/config/hooks.json");
     if source_hooks.is_file() && !layout.hooks_path.exists() {
@@ -290,9 +331,56 @@ fn materialize_antigravity_hooks(
         fs::copy(&source_hooks, &layout.hooks_path)
             .map_err(|err| home_err("copy antigravity hooks", &layout.hooks_path, err))?;
     }
+    Ok(())
+}
 
+fn materialize_antigravity_hooks(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+    ctx: &HookPushContext,
+) -> Result<(), CcbdError> {
+    copy_antigravity_hooks_if_missing(source_home, layout)?;
     let mut root = read_json_object(&layout.hooks_path).unwrap_or_default();
     inject_antigravity_hook_push(&mut root, ctx);
+    write_json_object(&layout.hooks_path, &root)
+}
+
+fn merge_antigravity_hooks(
+    source_home: &Path,
+    layout: &AntigravityHomeLayout,
+    hooks: &[MaterializedHook],
+) -> Result<(), CcbdError> {
+    copy_antigravity_hooks_if_missing(source_home, layout)?;
+    let mut root = read_json_object(&layout.hooks_path).unwrap_or_default();
+    let named_hook = object_entry(&mut root, "ah-bundle");
+    named_hook.clear();
+    for hook in hooks {
+        let event = named_hook
+            .entry(hook.event.clone())
+            .or_insert_with(|| Value::Array(vec![]));
+        if !event.is_array() {
+            *event = Value::Array(vec![]);
+        }
+        let Some(event_hooks) = event.as_array_mut() else {
+            continue;
+        };
+        let mut hook_item = Map::new();
+        hook_item.insert(
+            "type".to_string(),
+            Value::String(hook.item.hook_type.clone()),
+        );
+        hook_item.insert(
+            "command".to_string(),
+            Value::String(hook.item.command.clone()),
+        );
+        if let Some(timeout) = hook.item.timeout {
+            hook_item.insert("timeout".to_string(), Value::from(timeout));
+        }
+        event_hooks.push(serde_json::json!({
+            "matcher": hook.matcher,
+            "hooks": [Value::Object(hook_item)],
+        }));
+    }
     write_json_object(&layout.hooks_path, &root)
 }
 
@@ -395,6 +483,7 @@ fn materialize_builtin_rules(
     home_root: &Path,
     project_root: &Path,
     slot_id: &str,
+    bundle_layers: &[String],
 ) -> Result<(), CcbdError> {
     let Some(target) = builtin_rules_target(provider, home_root) else {
         return Ok(());
@@ -402,7 +491,7 @@ fn materialize_builtin_rules(
     if role == HomeLayoutRole::Master && provider != "claude" {
         return Ok(());
     }
-    let content = composed_rules_for_slot(role, project_root, slot_id)?;
+    let content = composed_rules_for_slot(role, project_root, slot_id, bundle_layers)?;
     write_builtin_rules(&target, &content)
 }
 
@@ -424,17 +513,26 @@ fn write_builtin_rules(path: &Path, content: &str) -> Result<(), CcbdError> {
 }
 
 pub fn compose_rules(kernel: &str, override_or_default: &str) -> String {
-    format!(
-        "{}\n\n---\n\n{}",
-        kernel.trim_end(),
-        override_or_default.trim_start()
-    )
+    compose_rules_with_layers(kernel, &[], override_or_default)
+}
+
+pub fn compose_rules_with_layers(
+    kernel: &str,
+    bundle_layers: &[String],
+    override_or_default: &str,
+) -> String {
+    let mut parts = Vec::with_capacity(bundle_layers.len() + 2);
+    parts.push(kernel.trim_end().to_string());
+    parts.extend(bundle_layers.iter().map(|layer| layer.trim().to_string()));
+    parts.push(override_or_default.trim_start().to_string());
+    parts.join("\n\n---\n\n")
 }
 
 fn composed_rules_for_slot(
     role: HomeLayoutRole,
     project_root: &Path,
     slot_id: &str,
+    bundle_layers: &[String],
 ) -> Result<String, CcbdError> {
     let kernel = role_kernel(role);
     let default = role_default_rules(role);
@@ -444,7 +542,7 @@ fn composed_rules_for_slot(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => default.to_string(),
         Err(err) => return Err(home_err("read project rules override", &override_path, err)),
     };
-    Ok(compose_rules(kernel, &body))
+    Ok(compose_rules_with_layers(kernel, bundle_layers, &body))
 }
 
 fn role_kernel(role: HomeLayoutRole) -> &'static str {
@@ -616,6 +714,50 @@ fn materialize_claude_hooks(
     materialize_hooks(source_home, &layout.claude_dir.join("hooks"), hooks)
 }
 
+fn resolve_skills(project_root: &Path, skills: &[String]) -> Result<Vec<ResolvedSkill>, CcbdError> {
+    if skills.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refs = parse_skill_refs(skills)?;
+    resolve_project_skills(project_root, &refs)
+}
+
+fn materialize_claude_skills(
+    layout: &ClaudeHomeLayout,
+    skills: &[ResolvedSkill],
+) -> Result<(), CcbdError> {
+    for item in plan_claude_skill_materialization(&layout.claude_dir, skills) {
+        force_symlink(&item.source_dir, &item.target_dir)?;
+    }
+    Ok(())
+}
+
+fn materialize_codex_skills(codex_home: &Path, skills: &[ResolvedSkill]) -> Result<(), CcbdError> {
+    for item in plan_codex_skill_materialization(codex_home, skills) {
+        force_symlink(&item.source_dir, &item.target_dir)?;
+    }
+    Ok(())
+}
+
+fn materialize_antigravity_skills(
+    layout: &AntigravityHomeLayout,
+    skills: &[ResolvedSkill],
+) -> Result<(), CcbdError> {
+    for skill in skills {
+        force_symlink(&skill.source_dir, &layout.skills_dir.join(&skill.name))?;
+    }
+    Ok(())
+}
+
+fn materialize_unwired_provider_skills(provider: &str, skills: &[String]) -> Result<(), CcbdError> {
+    if skills.is_empty() {
+        return Ok(());
+    }
+    Err(CcbdError::EnvironmentNotSupported {
+        details: format!("skills injection target is not wired for provider {provider:?}"),
+    })
+}
+
 fn materialize_hooks(
     source_home: &Path,
     target_dir: &Path,
@@ -745,7 +887,7 @@ fn prepare_managed_codex_home(
     project_root: &Path,
     role: HomeLayoutRole,
     slot_id: &str,
-    plugins: &[String],
+    extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<(), CcbdError> {
     fs::create_dir_all(codex_home).map_err(|err| home_err("create codex home", codex_home, err))?;
@@ -754,7 +896,14 @@ fn prepare_managed_codex_home(
             details: format!("codex home has no parent: {}", codex_home.display()),
         });
     };
-    materialize_builtin_rules(role, "codex", home_root, project_root, slot_id)?;
+    materialize_builtin_rules(
+        role,
+        "codex",
+        home_root,
+        project_root,
+        slot_id,
+        &extensions.rules,
+    )?;
     let session_root = codex_home.join("sessions");
     fs::create_dir_all(&session_root)
         .map_err(|err| home_err("create codex sessions", &session_root, err))?;
@@ -764,23 +913,38 @@ fn prepare_managed_codex_home(
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
     ensure_codex_workspace_trust(&target_config, workspace_key)?;
-    let plugins = resolve_plugins_for_provider("codex", source_home, plugins)?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
+    materialize_codex_skills(codex_home, &skills)?;
+    let plugins = resolve_plugins_for_provider("codex", source_home, &extensions.plugins)?;
     materialize_codex_plugins(codex_home, &plugins)?;
     enable_codex_plugins(&target_config, &plugins)?;
-    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "codex") {
-        let source_hooks = source_home.join(".codex/hooks.json");
-        let target_hooks = codex_home.join("hooks.json");
-        if source_hooks.is_file() && !target_hooks.exists() {
-            if let Some(parent) = target_hooks.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| home_err("create codex hooks parent", parent, err))?;
-            }
-            fs::copy(&source_hooks, &target_hooks)
-                .map_err(|err| home_err("copy codex hooks", &target_hooks, err))?;
+    materialize_codex_mcp(&target_config, &extensions.mcp)?;
+
+    let source_hooks = source_home.join(".codex/hooks.json");
+    let target_hooks = codex_home.join("hooks.json");
+    if source_hooks.is_file() && !target_hooks.exists() {
+        if let Some(parent) = target_hooks.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| home_err("create codex hooks parent", parent, err))?;
         }
-        enable_codex_hooks(&target_config)?;
+        fs::copy(&source_hooks, &target_hooks)
+            .map_err(|err| home_err("copy codex hooks", &target_hooks, err))?;
+    }
+
+    let hook_specs = materialize_hooks(source_home, &codex_home.join("hooks"), &extensions.hooks)?;
+    if !hook_specs.is_empty() {
+        merge_codex_hooks(codex_home, &hook_specs)?;
+    }
+
+    if let Some(ctx) = active_hook_push_ctx(hook_push_ctx, "codex") {
         merge_codex_hook_push(codex_home, ctx)?;
     }
+
+    if !hook_specs.is_empty() || active_hook_push_ctx(hook_push_ctx, "codex").is_some() {
+        enable_codex_hooks(&target_config)?;
+    }
+
     let source_version = source_home.join(".codex/version.json");
     let target_version = codex_home.join("version.json");
     if source_version.is_file() && !target_version.exists() {
@@ -791,6 +955,84 @@ fn prepare_managed_codex_home(
         let _ = fs::write(&target_migration, "ok\n");
     }
     Ok(())
+}
+
+fn merge_codex_hooks(codex_home: &Path, hooks: &[MaterializedHook]) -> Result<(), CcbdError> {
+    let hooks_path = codex_home.join("hooks.json");
+    let mut root = read_codex_hooks_for_hook_push(&hooks_path);
+    let hooks_root = object_entry(&mut root, "hooks");
+
+    let hooks_dir_str = codex_home.join("hooks").display().to_string();
+
+    // Clean up previously-materialized bundle hooks
+    for (_event, event_val) in hooks_root.iter_mut() {
+        if let Some(groups) = event_val.as_array_mut() {
+            groups.retain_mut(|group| {
+                if let Some(items) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    items.retain(|item| {
+                        if let Some(command) = item.get("command").and_then(|c| c.as_str()) {
+                            !command.starts_with(&hooks_dir_str)
+                        } else {
+                            true
+                        }
+                    });
+                    !items.is_empty()
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    // Now, insert the new bundle hooks
+    for hook in hooks {
+        let event_val = hooks_root
+            .entry(hook.event.clone())
+            .or_insert_with(|| Value::Array(vec![]));
+        if !event_val.is_array() {
+            *event_val = Value::Array(vec![]);
+        }
+        let Some(event_hooks) = event_val.as_array_mut() else {
+            continue;
+        };
+
+        let mut hook_item = Map::new();
+        hook_item.insert(
+            "type".to_string(),
+            Value::String(hook.item.hook_type.clone()),
+        );
+        hook_item.insert(
+            "command".to_string(),
+            Value::String(hook.item.command.clone()),
+        );
+        if let Some(timeout) = hook.item.timeout {
+            hook_item.insert("timeout".to_string(), Value::from(timeout));
+        }
+
+        let mut merged = false;
+        for group in event_hooks.iter_mut() {
+            if group.get("matcher").and_then(|m| m.as_str()) == Some(&hook.matcher) {
+                if let Some(items) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    if !items.iter().any(|item| {
+                        item.get("command").and_then(|c| c.as_str()) == Some(&hook.item.command)
+                    }) {
+                        items.push(Value::Object(hook_item.clone()));
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+        }
+
+        if !merged {
+            event_hooks.push(serde_json::json!({
+                "matcher": hook.matcher,
+                "hooks": [Value::Object(hook_item)],
+            }));
+        }
+    }
+
+    write_json_object(&hooks_path, &root)
 }
 
 fn enable_codex_hooks(path: &Path) -> Result<(), CcbdError> {
@@ -950,6 +1192,315 @@ fn enable_codex_plugins(path: &Path, plugins: &[ResolvedPlugin]) -> Result<(), C
         plugin_table.insert("enabled".to_string(), TomlValue::Boolean(true));
     }
     write_codex_config(path, &root)
+}
+
+fn materialize_claude_mcp(
+    layout: &ClaudeHomeLayout,
+    workspace_key: &str,
+    servers: &[McpServerConfig],
+) -> Result<(), CcbdError> {
+    let servers = filter_mcp_for_provider("claude", servers)?;
+    if servers.is_empty() {
+        return Ok(());
+    }
+    for path in [&layout.trust_path, &layout.config_dir_state_path] {
+        let mut root = read_json_object(path).unwrap_or_default();
+        let projects = object_entry(&mut root, "projects");
+        let workspace = object_entry(projects, workspace_key);
+        let mcp_servers = object_entry(workspace, "mcpServers");
+        for server in &servers {
+            mcp_servers.insert(
+                server.name.clone(),
+                render_claude_mcp_server(server, &host_env_var)?,
+            );
+        }
+        write_json_object(path, &root)?;
+    }
+    Ok(())
+}
+
+fn render_claude_mcp_server<F>(server: &McpServerConfig, lookup: &F) -> Result<Value, CcbdError>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let mut value = Map::new();
+    match server.transport {
+        McpTransport::Stdio => {
+            value.insert(
+                "command".to_string(),
+                Value::String(resolve_secret_placeholders(
+                    server.command.as_deref().unwrap_or_default(),
+                    &server.name,
+                    lookup,
+                )?),
+            );
+            value.insert(
+                "args".to_string(),
+                Value::Array(
+                    server
+                        .args
+                        .iter()
+                        .map(|arg| {
+                            resolve_secret_placeholders(arg, &server.name, lookup)
+                                .map(Value::String)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            );
+            value.insert(
+                "env".to_string(),
+                Value::Object(resolve_secret_map(&server.env, &server.name, lookup)?),
+            );
+        }
+        McpTransport::Http | McpTransport::Sse => {
+            value.insert(
+                "url".to_string(),
+                Value::String(resolve_secret_placeholders(
+                    server.url.as_deref().unwrap_or_default(),
+                    &server.name,
+                    lookup,
+                )?),
+            );
+            value.insert(
+                "headers".to_string(),
+                Value::Object(resolve_secret_map(&server.headers, &server.name, lookup)?),
+            );
+        }
+    }
+    Ok(Value::Object(value))
+}
+
+fn materialize_codex_mcp(path: &Path, servers: &[McpServerConfig]) -> Result<(), CcbdError> {
+    let servers = filter_mcp_for_provider("codex", servers)?;
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let data = fs::read_to_string(path).unwrap_or_default();
+    let mut root = data
+        .parse::<TomlValue>()
+        .unwrap_or_else(|_| TomlValue::Table(toml::map::Map::new()));
+    if !root.is_table() {
+        root = TomlValue::Table(toml::map::Map::new());
+    }
+    let root_table = root.as_table_mut().expect("root was normalized to table");
+    let mcp_servers = table_entry(root_table, "mcp_servers");
+    for server in &servers {
+        let table = table_entry(mcp_servers, &server.name);
+        table.clear();
+        table.insert(
+            "command".to_string(),
+            TomlValue::String(resolve_secret_placeholders(
+                server.command.as_deref().unwrap_or_default(),
+                &server.name,
+                &host_env_var,
+            )?),
+        );
+        if !server.args.is_empty() {
+            table.insert(
+                "args".to_string(),
+                TomlValue::Array(
+                    server
+                        .args
+                        .iter()
+                        .map(|arg| {
+                            resolve_secret_placeholders(arg, &server.name, &host_env_var)
+                                .map(TomlValue::String)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            );
+        }
+        if !server.env.is_empty() {
+            table.insert(
+                "env".to_string(),
+                TomlValue::Table(resolve_secret_toml_map(&server.env, &server.name)?),
+            );
+        }
+    }
+    write_codex_config(path, &root)
+}
+
+fn materialize_antigravity_mcp(
+    layout: &AntigravityHomeLayout,
+    servers: &[McpServerConfig],
+) -> Result<(), CcbdError> {
+    let servers = filter_mcp_for_provider("antigravity", servers)?;
+    if servers.is_empty() {
+        return Ok(());
+    }
+    let mut root = read_json_object(&layout.mcp_config_path).unwrap_or_default();
+    let mcp_servers = object_entry(&mut root, "mcpServers");
+    for server in &servers {
+        mcp_servers.insert(
+            server.name.clone(),
+            render_antigravity_mcp_server(server, &host_env_var)?,
+        );
+    }
+    write_json_object(&layout.mcp_config_path, &root)
+}
+
+fn render_antigravity_mcp_server<F>(
+    server: &McpServerConfig,
+    lookup: &F,
+) -> Result<Value, CcbdError>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let mut value = Map::new();
+    match server.transport {
+        McpTransport::Stdio => {
+            value.insert(
+                "command".to_string(),
+                Value::String(resolve_secret_placeholders(
+                    server.command.as_deref().unwrap_or_default(),
+                    &server.name,
+                    lookup,
+                )?),
+            );
+            value.insert(
+                "args".to_string(),
+                Value::Array(
+                    server
+                        .args
+                        .iter()
+                        .map(|arg| {
+                            resolve_secret_placeholders(arg, &server.name, lookup)
+                                .map(Value::String)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            );
+            value.insert(
+                "env".to_string(),
+                Value::Object(resolve_secret_map(&server.env, &server.name, lookup)?),
+            );
+        }
+        McpTransport::Http | McpTransport::Sse => {
+            value.insert(
+                "serverUrl".to_string(),
+                Value::String(resolve_secret_placeholders(
+                    server.url.as_deref().unwrap_or_default(),
+                    &server.name,
+                    lookup,
+                )?),
+            );
+            if !server.headers.is_empty() {
+                value.insert(
+                    "headers".to_string(),
+                    Value::Object(resolve_secret_map(&server.headers, &server.name, lookup)?),
+                );
+            }
+        }
+    }
+    Ok(Value::Object(value))
+}
+
+fn filter_mcp_for_provider<'a>(
+    provider: &str,
+    servers: &'a [McpServerConfig],
+) -> Result<Vec<&'a McpServerConfig>, CcbdError> {
+    let mut supported = Vec::new();
+    for server in servers {
+        if mcp_transport_supported(provider, server.transport) {
+            supported.push(server);
+        } else if server.optional {
+            tracing::warn!(
+                provider,
+                server = %server.name,
+                transport = ?server.transport,
+                "skipping optional unsupported bundle MCP server"
+            );
+        } else {
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!(
+                    "bundle MCP server {:?} uses unsupported transport {:?} for provider {provider}",
+                    server.name, server.transport
+                ),
+            });
+        }
+    }
+    Ok(supported)
+}
+
+fn mcp_transport_supported(provider: &str, transport: McpTransport) -> bool {
+    match provider {
+        "claude" | "antigravity" => true,
+        "codex" => transport == McpTransport::Stdio,
+        _ => false,
+    }
+}
+
+fn resolve_secret_map<F>(
+    map: &HashMap<String, String>,
+    server_name: &str,
+    lookup: &F,
+) -> Result<Map<String, Value>, CcbdError>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let mut resolved = Map::new();
+    for (key, value) in map {
+        resolved.insert(
+            key.clone(),
+            Value::String(resolve_secret_placeholders(value, server_name, lookup)?),
+        );
+    }
+    Ok(resolved)
+}
+
+fn resolve_secret_toml_map(
+    map: &HashMap<String, String>,
+    server_name: &str,
+) -> Result<toml::map::Map<String, TomlValue>, CcbdError> {
+    let mut resolved = toml::map::Map::new();
+    for (key, value) in map {
+        resolved.insert(
+            key.clone(),
+            TomlValue::String(resolve_secret_placeholders(
+                value,
+                server_name,
+                &host_env_var,
+            )?),
+        );
+    }
+    Ok(resolved)
+}
+
+fn host_env_var(name: &str) -> Result<String, std::env::VarError> {
+    std::env::var(name)
+}
+
+fn resolve_secret_placeholders<F>(
+    value: &str,
+    server_name: &str,
+    lookup: &F,
+) -> Result<String, CcbdError>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!(
+                    "bundle MCP server {server_name:?} contains an invalid environment placeholder"
+                ),
+            });
+        };
+        let var = &after[..end];
+        let resolved = lookup(var).map_err(|_| CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "bundle MCP server {server_name:?} requires {var}, not set in current environment"
+            ),
+        })?;
+        output.push_str(&resolved);
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    Ok(output)
 }
 
 pub fn sandbox_home_for_sandbox_dir(sandbox_dir: &Path) -> Result<PathBuf, CcbdError> {
@@ -1394,10 +1945,12 @@ impl ClaudeHomeLayout {
 struct AntigravityHomeLayout {
     antigravity_dir: PathBuf,
     cache_dir: PathBuf,
+    skills_dir: PathBuf,
     settings_path: PathBuf,
     config_path: PathBuf,
     config_settings_path: PathBuf,
     hooks_path: PathBuf,
+    mcp_config_path: PathBuf,
     onboarding_path: PathBuf,
 }
 
@@ -1409,10 +1962,12 @@ impl AntigravityHomeLayout {
         Self {
             antigravity_dir: antigravity_dir.clone(),
             cache_dir: cache_dir.clone(),
+            skills_dir: config_dir.join("skills"),
             settings_path: antigravity_dir.join("settings.json"),
             config_path: config_dir.join("config.json"),
             config_settings_path: config_dir.join("settings.json"),
             hooks_path: config_dir.join("hooks.json"),
+            mcp_config_path: config_dir.join("mcp_config.json"),
             onboarding_path: cache_dir.join("onboarding.json"),
         }
     }
@@ -1470,6 +2025,7 @@ mod tests {
             home.path(),
             project.path(),
             "worker",
+            &[],
         )
         .unwrap();
 
@@ -1495,6 +2051,7 @@ mod tests {
             workspace.path(),
             HomeLayoutRole::Worker,
             "worker",
+            &crate::provider::extensions::ExtensionConfig::default(),
             None,
         )
         .unwrap();
@@ -1522,9 +2079,11 @@ mod tests {
         std::fs::write(project.path().join(".ah/rules/a1.md"), "USER A1 RULES").unwrap();
 
         let user_doc =
-            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a1").unwrap();
+            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a1", &[])
+                .unwrap();
         let default_doc =
-            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a2").unwrap();
+            super::composed_rules_for_slot(HomeLayoutRole::Worker, project.path(), "a2", &[])
+                .unwrap();
 
         assert!(user_doc.contains("USER A1 RULES"));
         assert!(!user_doc.contains("Grep-before-claim"));
@@ -1548,6 +2107,7 @@ mod tests {
             claude_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
         super::materialize_builtin_rules(
@@ -1556,6 +2116,7 @@ mod tests {
             antigravity_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
         super::materialize_builtin_rules(
@@ -1564,6 +2125,7 @@ mod tests {
             codex_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
 
@@ -1593,6 +2155,7 @@ mod tests {
             master_home.path(),
             project.path(),
             "master",
+            &[],
         )
         .unwrap();
         super::materialize_builtin_rules(
@@ -1601,6 +2164,7 @@ mod tests {
             worker_home.path(),
             project.path(),
             "a1",
+            &[],
         )
         .unwrap();
 
@@ -1654,6 +2218,7 @@ mod tests {
             workspace.path(),
             HomeLayoutRole::Worker,
             "worker",
+            &crate::provider::extensions::ExtensionConfig::default(),
             Some(&ctx),
         )
         .unwrap();
@@ -1761,5 +2326,213 @@ mod tests {
         let root_state = read_json_object(&target.path().join(".claude.json")).unwrap();
         assert_eq!(root_state["trusted"], true);
         assert_eq!(config_dir_state["trusted"], true);
+    }
+
+    #[test]
+    fn mcp_secret_placeholders_resolve_only_at_render_time() {
+        let resolved = super::resolve_secret_placeholders(
+            "Bearer ${ACME_KEY}",
+            "remote",
+            &|name| match name {
+                "ACME_KEY" => Ok("secret-value".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, "Bearer secret-value");
+    }
+
+    #[test]
+    fn mcp_missing_secret_reports_variable_name_not_value() {
+        let err = super::resolve_secret_placeholders("Bearer ${ACME_KEY}", "remote", &|_| {
+            Err(std::env::VarError::NotPresent)
+        })
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("ACME_KEY"), "{message}");
+        assert!(!message.contains("secret-value"), "{message}");
+    }
+
+    #[test]
+    fn claude_mcp_stdio_renders_command_args_and_env() {
+        use crate::provider::extensions::{McpServerConfig, McpTransport};
+        use std::collections::HashMap;
+
+        let server = McpServerConfig {
+            name: "context7".to_string(),
+            transport: McpTransport::Stdio,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string(), "@upstash/context7-mcp".to_string()],
+            env: HashMap::from([(
+                "CONTEXT7_TOKEN".to_string(),
+                "${CONTEXT7_TOKEN}".to_string(),
+            )]),
+            url: None,
+            headers: HashMap::new(),
+            optional: false,
+        };
+        let rendered = super::render_claude_mcp_server(&server, &|name| match name {
+            "CONTEXT7_TOKEN" => Ok("secret-value".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .unwrap();
+
+        assert_eq!(rendered["command"], "npx");
+        assert_eq!(rendered["args"][0], "-y");
+        assert_eq!(rendered["env"]["CONTEXT7_TOKEN"], "secret-value");
+    }
+
+    #[test]
+    fn antigravity_mcp_remote_uses_server_url_not_legacy_keys() {
+        use crate::provider::extensions::{McpServerConfig, McpTransport};
+        use std::collections::HashMap;
+
+        let server = McpServerConfig {
+            name: "remote".to_string(),
+            transport: McpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some("https://mcp.example.test/sse".to_string()),
+            headers: HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer ${ACME_KEY}".to_string(),
+            )]),
+            optional: false,
+        };
+        let rendered = super::render_antigravity_mcp_server(&server, &|name| match name {
+            "ACME_KEY" => Ok("secret-value".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .unwrap();
+
+        assert_eq!(rendered["serverUrl"], "https://mcp.example.test/sse");
+        assert!(rendered.get("url").is_none());
+        assert!(rendered.get("httpUrl").is_none());
+        assert_eq!(rendered["headers"]["Authorization"], "Bearer secret-value");
+    }
+
+    #[test]
+    fn codex_mcp_remote_is_unsupported_unless_optional() {
+        use crate::provider::extensions::{McpServerConfig, McpTransport};
+        use std::collections::HashMap;
+
+        let required = McpServerConfig {
+            name: "remote".to_string(),
+            transport: McpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some("https://mcp.example.test/sse".to_string()),
+            headers: HashMap::new(),
+            optional: false,
+        };
+        let mut optional = required.clone();
+        optional.optional = true;
+
+        assert!(super::filter_mcp_for_provider("codex", &[required]).is_err());
+        assert!(
+            super::filter_mcp_for_provider("codex", &[optional])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn claude_mcp_remote_writes_workspace_servers_to_both_trust_files() {
+        use crate::provider::extensions::{McpServerConfig, McpTransport};
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let layout = super::ClaudeHomeLayout::for_home(home.path());
+        let server = McpServerConfig {
+            name: "remote".to_string(),
+            transport: McpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some("https://mcp.example.test/sse".to_string()),
+            headers: HashMap::new(),
+            optional: false,
+        };
+
+        super::materialize_claude_mcp(&layout, "/workspace", &[server]).unwrap();
+
+        for path in [&layout.trust_path, &layout.config_dir_state_path] {
+            let root = super::read_json_object(path).unwrap();
+            assert_eq!(
+                root["projects"]["/workspace"]["mcpServers"]["remote"]["url"],
+                "https://mcp.example.test/sse"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_mcp_stdio_writes_mcp_servers_table() {
+        use crate::provider::extensions::{McpServerConfig, McpTransport};
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let config = home.path().join("config.toml");
+        std::fs::write(&config, "# local codex config\n").unwrap();
+        let server = McpServerConfig {
+            name: "context7".to_string(),
+            transport: McpTransport::Stdio,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string()],
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            optional: false,
+        };
+
+        super::materialize_codex_mcp(&config, &[server]).unwrap();
+
+        let data = std::fs::read_to_string(config).unwrap();
+        assert!(data.contains("[mcp_servers.context7]"), "{data}");
+        assert!(data.contains("command = \"npx\""), "{data}");
+        assert!(data.contains("args = [\"-y\"]"), "{data}");
+    }
+
+    #[test]
+    fn antigravity_mcp_stdio_writes_mcp_config_json() {
+        use crate::provider::extensions::{McpServerConfig, McpTransport};
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let layout = super::AntigravityHomeLayout::for_home(home.path());
+        let server = McpServerConfig {
+            name: "context7".to_string(),
+            transport: McpTransport::Stdio,
+            command: Some("npx".to_string()),
+            args: vec!["-y".to_string()],
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            optional: false,
+        };
+
+        super::materialize_antigravity_mcp(&layout, &[server]).unwrap();
+
+        let root = super::read_json_object(&layout.mcp_config_path).unwrap();
+        assert_eq!(root["mcpServers"]["context7"]["command"], "npx");
+        assert_eq!(root["mcpServers"]["context7"]["args"][0], "-y");
+    }
+
+    #[test]
+    fn no_mcp_does_not_create_antigravity_mcp_config() {
+        use tempfile::TempDir;
+
+        let home = TempDir::new().unwrap();
+        let layout = super::AntigravityHomeLayout::for_home(home.path());
+
+        super::materialize_antigravity_mcp(&layout, &[]).unwrap();
+
+        assert!(!layout.mcp_config_path.exists());
     }
 }

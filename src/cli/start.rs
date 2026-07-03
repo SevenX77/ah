@@ -1,10 +1,8 @@
 use crate::cli::config::{ProjectConfig, find_config, load_project_config};
 use crate::cli::output::string_field;
 use crate::cli::rpc_client::{CliError, RpcClient};
-use crate::provider::manifest::ENV_PASSTHROUGH;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -28,15 +26,7 @@ pub struct SpawnedAgent {
 }
 
 pub fn build_ahd_systemd_run_command(ahd_bin: &Path, state_dir: &Path) -> Vec<String> {
-    let env = ENV_PASSTHROUGH
-        .iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| ((*key).to_string(), value))
-        })
-        .collect::<Vec<_>>();
-    build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, &env)
+    crate::platform::sys::service::build_ahd_systemd_run_command(ahd_bin, state_dir)
 }
 
 pub fn build_ahd_systemd_run_command_with_env(
@@ -44,26 +34,7 @@ pub fn build_ahd_systemd_run_command_with_env(
     state_dir: &Path,
     env: &[(String, String)],
 ) -> Vec<String> {
-    let mut cmd = vec![
-        "systemd-run".to_string(),
-        "--user".to_string(),
-        "--unit=ahd.service".to_string(),
-        "--property=Restart=on-failure".to_string(),
-        "--property=RestartSec=1s".to_string(),
-        "--property=StartLimitIntervalSec=60".to_string(),
-        "--property=StartLimitBurst=5".to_string(),
-        "--property=OOMScoreAdjust=-900".to_string(),
-        "--setenv".to_string(),
-        format!("AH_STATE_DIR={}", state_dir.display()),
-    ];
-    for key in ENV_PASSTHROUGH {
-        if let Some((_, value)) = env.iter().find(|(candidate, _)| candidate == key) {
-            cmd.push("--setenv".to_string());
-            cmd.push(format!("{key}={value}"));
-        }
-    }
-    cmd.push(ahd_bin.display().to_string());
-    cmd
+    crate::platform::sys::service::build_ahd_systemd_run_command_with_env(ahd_bin, state_dir, env)
 }
 
 pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str) -> bool {
@@ -72,15 +43,7 @@ pub fn should_skip_systemd_bootstrap_for_cgroup(cgroup: &str, target_unit: &str)
 }
 
 pub fn ahd_reset_failed_is_best_effort(unit: &str) -> bool {
-    if let Err(err) = Command::new("systemctl")
-        .args(["--user", "reset-failed", unit])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        tracing::warn!(unit, error = %err, "systemctl reset-failed failed before ahd bootstrap");
-    }
-    true
+    crate::platform::sys::service::ahd_reset_failed_is_best_effort(unit)
 }
 
 pub async fn start_from_options(
@@ -161,6 +124,8 @@ pub async fn start_project(
                     "cmd": config.master.cmd.clone(),
                     "hooks": config.master.hooks,
                     "plugins": config.master.plugins,
+                    "skills": config.master.skills,
+                    "bundle": config.master.bundle,
                 }),
             )
             .await?;
@@ -193,6 +158,8 @@ pub async fn start_project(
                     "extra_env_vars": merged_env,
                     "hooks": agent.hooks,
                     "plugins": agent.plugins,
+                    "skills": agent.skills,
+                    "bundle": agent.bundle,
                     "hook_push_enabled": config.completion.hook_push_enabled,
                     "sandbox_overrides": sandbox_overrides,
                 }),
@@ -282,6 +249,8 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
             "cmd": config.master.cmd,
             "hooks": config.master.hooks,
             "plugins": config.master.plugins,
+            "skills": config.master.skills,
+            "bundle": config.master.bundle,
         },
         "agents": config.agents.iter().map(|(agent_id, agent)| {
             json!({
@@ -290,6 +259,8 @@ fn build_realign_payload(session_id: &str, config: &ProjectConfig, force: bool) 
                 "env": agent.env,
                 "hooks": agent.hooks,
                 "plugins": agent.plugins,
+                "skills": agent.skills,
+                "bundle": agent.bundle,
             })
         }).collect::<Vec<_>>()
     })
@@ -363,7 +334,9 @@ pub fn print_start_summary(summary: &StartSummary) {
 #[cfg(test)]
 mod tests {
     use super::{should_skip_systemd_bootstrap_for_cgroup, start_project};
-    use crate::cli::config::{AgentConfig, MasterConfig, ProjectConfig, SandboxConfig};
+    use crate::cli::config::{
+        AgentConfig, MasterConfig, ProjectConfig, SandboxConfig, load_project_config,
+    };
     use crate::cli::rpc_client::{CliError, RpcClient, RpcFuture};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -561,6 +534,38 @@ mod tests {
         assert_eq!(first_agent.1["hook_push_enabled"].as_bool(), Some(true));
     }
 
+    #[tokio::test]
+    async fn gemini_provider_alias_flows_to_agent_spawn_as_antigravity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ah.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = "1"
+
+[master]
+enabled = false
+
+[agents.a1]
+provider = "gemini"
+"#,
+        )
+        .unwrap();
+        let config = load_project_config(&path).unwrap();
+        let client = recording_client();
+
+        start_project(&client, config, &path, dir.path().to_path_buf(), false)
+            .await
+            .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        let first_agent = calls
+            .iter()
+            .find(|(method, _)| method == "agent.spawn")
+            .unwrap();
+        assert_eq!(first_agent.1["provider"], "antigravity");
+    }
+
     fn project_config(master_enabled: bool) -> ProjectConfig {
         let mut agents = BTreeMap::new();
         for (id, provider) in [
@@ -576,6 +581,8 @@ mod tests {
                     env: Default::default(),
                     hooks: Default::default(),
                     plugins: Default::default(),
+                    skills: Default::default(),
+                    bundle: Default::default(),
                 },
             );
         }
@@ -588,6 +595,8 @@ mod tests {
                 enabled: master_enabled,
                 hooks: Default::default(),
                 plugins: Default::default(),
+                skills: Default::default(),
+                bundle: Default::default(),
             },
             completion: Default::default(),
             daemon: Default::default(),

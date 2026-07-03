@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use ah::agent_io::{
     AgentIoEntry, RuntimeCleanupPolicy, cleanup_agent_runtime_resources_with_policy, register,
 };
@@ -44,6 +45,8 @@ fn fixture_project_config() -> ProjectConfig {
             env: HashMap::new(),
             hooks: HashMap::new(),
             plugins: Vec::new(),
+            skills: Vec::new(),
+            bundle: Vec::new(),
         },
     );
     ProjectConfig {

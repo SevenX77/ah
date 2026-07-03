@@ -34,7 +34,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use tokio::io::unix::AsyncFd;
+use tokio::io::{Interest, unix::AsyncFd};
 
 #[allow(dead_code)]
 const MASTER_REVIVE_CONTINUE_INSTRUCTION: &str = "继续";
@@ -427,7 +427,7 @@ pub fn spawn_master_pidfd_watch_task(
     daemon_unit: Option<String>,
 ) {
     tokio::spawn(async move {
-        let async_fd = match AsyncFd::new(pidfd) {
+        let async_fd = match AsyncFd::with_interest(pidfd, Interest::READABLE) {
             Ok(fd) => fd,
             Err(err) => {
                 tracing::warn!(session_id = %session_id, error = %err, "failed to create AsyncFd for master pidfd");
@@ -772,7 +772,10 @@ async fn revive_master_after_exit_windowed(
             tracing::warn!(session_id = %session_id, home = %home_root.display(), "master revive reusing existing home; auth symlink not present");
         }
         master_env_vars.insert("HOME".to_string(), home_root.display().to_string());
-        master_env_vars.insert("CLAUDE_CONFIG_DIR".to_string(), ".claude".to_string());
+        master_env_vars.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            home_root.join(".claude").display().to_string(),
+        );
         home_root
     };
     let tmux_cmd = if env_state.systemd_run_available || env_state.unsafe_no_sandbox {
@@ -1958,6 +1961,9 @@ async fn reprovision_declared_workers_after_master_revive(
             env: stored.spec.env.clone(),
             hooks: stored.spec.hooks.clone(),
             plugins: stored.spec.plugins.clone(),
+            skills: stored.spec.skills.clone(),
+            bundle: stored.spec.bundle.clone(),
+            bundle_digest: stored.spec.bundle_digest.clone(),
             sandbox_overrides: stored.spec.sandbox_overrides.clone(),
             hook_push_enabled: stored.spec.hook_push_enabled,
         };
@@ -4338,6 +4344,9 @@ mod tests {
                     )]),
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
+                    skills: Vec::new(),
+                    bundle: Vec::new(),
+                    bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
                 },
@@ -4480,6 +4489,11 @@ mod tests {
             .unwrap();
         }
 
+        let master_sandbox_dir =
+            crate::sandbox::path::resolve_sandbox_dir(&state_dir, &session_id, "master").unwrap();
+        let expected_home =
+            crate::provider::home_layout::sandbox_home_for_sandbox_dir(&master_sandbox_dir)
+                .unwrap();
         let env_capture = state_dir.join("batch-g-revived-master-env");
         let redispatch_marker = master_revival_redispatch_marker_path(&state_dir, &session_id, 6);
         let expected_socket = state_dir.join("ahd.sock");
@@ -4491,13 +4505,13 @@ mod tests {
             db.clone(),
             tmux.clone(),
             format!(
-                "printf '%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" > {}; sleep 5",
+                "printf '%s\n%s\n%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" \"$HOME\" \"$CLAUDE_CONFIG_DIR\" > {}; sleep 5",
                 env_capture.display()
             ),
             state_dir.clone(),
             crate::sandbox::EnvState {
                 systemd_run_available: false,
-                unsafe_no_sandbox: true,
+                unsafe_no_sandbox: false,
                 under_systemd: false,
             },
             None,
@@ -4516,6 +4530,12 @@ mod tests {
         assert_eq!(env_lines[1], expected_socket.display().to_string());
         assert_eq!(env_lines[2], "managed");
         assert_eq!(env_lines[3], redispatch_marker.display().to_string());
+        assert_eq!(env_lines[4], expected_home.display().to_string());
+        assert_eq!(
+            env_lines[5],
+            expected_home.join(".claude").display().to_string(),
+            "revived master CLAUDE_CONFIG_DIR must point at its sandbox .claude"
+        );
         assert!(redispatch_marker.exists());
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
@@ -4643,6 +4663,9 @@ mod tests {
                     )]),
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
+                    skills: Vec::new(),
+                    bundle: Vec::new(),
+                    bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
                 },
@@ -4748,6 +4771,9 @@ mod tests {
                     env: std::collections::HashMap::new(),
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
+                    skills: Vec::new(),
+                    bundle: Vec::new(),
+                    bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
                 },
@@ -4873,6 +4899,9 @@ mod tests {
                     env: std::collections::HashMap::new(),
                     hooks: std::collections::HashMap::new(),
                     plugins: Vec::new(),
+                    skills: Vec::new(),
+                    bundle: Vec::new(),
+                    bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
                 },

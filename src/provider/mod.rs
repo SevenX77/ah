@@ -1,4 +1,5 @@
 pub mod builtin;
+pub mod bundles;
 pub mod extensions;
 pub mod fingerprint;
 pub mod health_check;
@@ -7,3 +8,4 @@ pub mod init_probe;
 pub mod init_probe_task;
 pub mod manifest;
 pub mod plugins;
+pub mod skills;

@@ -1,6 +1,7 @@
 use crate::db::Db;
 use crate::error::CcbdError;
 use crate::provider::extensions::HookGroup;
+use crate::provider::fingerprint::BundleDigest;
 use crate::sandbox::SandboxOverrides;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -92,6 +93,12 @@ pub struct AgentSpawnSpec {
     pub hooks: HashMap<String, Vec<HookGroup>>,
     #[serde(default)]
     pub plugins: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub bundle: Vec<String>,
+    #[serde(default)]
+    pub bundle_digest: Option<BundleDigest>,
     #[serde(default)]
     pub sandbox_overrides: SandboxOverrides,
     #[serde(default)]
@@ -721,6 +728,9 @@ mod tests {
             env,
             hooks,
             plugins: vec!["github@openai-curated".to_string()],
+            skills: Vec::new(),
+            bundle: Vec::new(),
+            bundle_digest: None,
             sandbox_overrides: SandboxOverrides::default(),
             hook_push_enabled: false,
         }
@@ -1230,6 +1240,7 @@ mod tests {
             let mut second = sample_spec("a1", "claude");
             second.env.insert("NEW".to_string(), "1".to_string());
             second.plugins.push("extra@local".to_string());
+            second.skills.push("domain-review".to_string());
             persist_agent_spawn_spec_sync(&conn, &second, "hash2").unwrap();
             let overwritten = query_agent_spawn_spec_sync(&conn, "a1").unwrap().unwrap();
             assert_eq!(overwritten.spec.agent_id, "a1");
@@ -1241,6 +1252,12 @@ mod tests {
                     .spec
                     .plugins
                     .contains(&"extra@local".to_string())
+            );
+            assert!(
+                overwritten
+                    .spec
+                    .skills
+                    .contains(&"domain-review".to_string())
             );
             assert_eq!(overwritten.config_hash, "hash2");
             assert!(overwritten.spec_version >= stored.spec_version);
@@ -1289,6 +1306,25 @@ mod tests {
         .unwrap();
 
         assert!(spec.sandbox_overrides.extra_ro_binds.is_empty());
+        assert!(spec.bundle.is_empty());
+        assert!(spec.bundle_digest.is_none());
+    }
+
+    #[test]
+    fn ra1_spawn_spec_serialization_never_contains_resolved_mcp_secret() {
+        let mut spec = sample_spec("a1", "claude");
+        spec.bundle = vec!["mcp".to_string()];
+        spec.bundle_digest = Some(crate::provider::fingerprint::BundleDigest {
+            bundles: vec![crate::provider::fingerprint::BundleDigestEntry {
+                name: "mcp".to_string(),
+                digest: "manifest contains ${ACME_KEY}".to_string(),
+            }],
+        });
+
+        let json = serde_json::to_string(&spec).unwrap();
+
+        assert!(json.contains("${ACME_KEY}"));
+        assert!(!json.contains("secret-value"));
     }
 
     #[test]

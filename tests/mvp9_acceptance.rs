@@ -337,6 +337,8 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             env: agent_env,
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
+            bundle: Default::default(),
         },
     );
     let config = ProjectConfig {
@@ -348,6 +350,8 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             enabled: false,
             hooks: Default::default(),
             plugins: Default::default(),
+            skills: Default::default(),
+            bundle: Default::default(),
         },
         completion: Default::default(),
         daemon: Default::default(),
