@@ -15,6 +15,7 @@ use ah::cli::prompt::{PromptResolveOptions, run_prompt_resolve};
 use ah::cli::rpc_client::{
     CliError, RpcClient, UnixRpcClient, exit_code, resolve_socket_path_for_config, rpc_stream_first,
 };
+use ah::cli::setup::{SetupOptions, run_setup};
 use ah::cli::start::{
     StartOptions, ahd_reset_failed_is_best_effort, build_ahd_systemd_run_command,
     print_start_summary, should_skip_systemd_bootstrap_for_cgroup, start_from_options,
@@ -27,7 +28,9 @@ use ah::cli::{
     },
     service_unit::derive_unit_name,
 };
-use ah::tmux::{agent_session_name, compute_socket_name, master_session_name};
+use ah::tmux::{
+    TmuxPaneId, TmuxServer, agent_session_name, compute_socket_name, master_session_name,
+};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -70,6 +73,15 @@ enum Cmd {
         text: String,
         #[arg(long)]
         wait: bool,
+        #[arg(long)]
+        request_id: Option<String>,
+    },
+    /// Asynchronously deliver text to the master pane.
+    Tell {
+        target: String,
+        text: String,
+        #[arg(long)]
+        session: Option<String>,
         #[arg(long)]
         request_id: Option<String>,
     },
@@ -120,6 +132,19 @@ enum Cmd {
     },
     /// Run local environment diagnostics.
     Doctor,
+    /// Check or prepare ah runtime prerequisites.
+    Setup {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        fix: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        resume: bool,
+    },
     /// Validate or migrate project configuration.
     Config {
         #[command(subcommand)]
@@ -248,6 +273,12 @@ async fn main() {
             wait,
             request_id,
         }) => cmd_ask(&client, agent_id, text, wait, request_id).await,
+        Some(Cmd::Tell {
+            target,
+            text,
+            session,
+            request_id,
+        }) => cmd_tell(&client, target, text, session, request_id).await,
         Some(Cmd::Pend { job_id }) => cmd_pend(&client, job_id).await,
         Some(Cmd::Cancel { job_id }) => cmd_cancel(&client, job_id).await,
         Some(Cmd::Kill {
@@ -297,7 +328,14 @@ async fn main() {
                 .await
             }
         },
-        Some(Cmd::Doctor) => cmd_doctor(&client).await,
+        Some(Cmd::Doctor) => cmd_doctor(&client, cli.config.as_deref()).await,
+        Some(Cmd::Setup {
+            check,
+            fix,
+            yes,
+            json,
+            resume,
+        }) => cmd_setup(check, fix, yes, json, resume),
         Some(Cmd::Config { cmd }) => match cmd {
             ConfigCmd::Validate { config } => run_config_validate(&config),
             ConfigCmd::Migrate => cmd_config_migrate(),
@@ -354,6 +392,22 @@ async fn main() {
         }
         std::process::exit(code);
     }
+}
+
+fn cmd_setup(check: bool, fix: bool, yes: bool, json: bool, resume: bool) -> Result<(), CliError> {
+    let run = run_setup(SetupOptions {
+        check,
+        fix,
+        yes,
+        json,
+        resume,
+    })
+    .map_err(|err| CliError::Config(format!("failed to render setup output: {err}")))?;
+    print!("{}", run.output);
+    if run.exit_code != 0 {
+        std::process::exit(run.exit_code);
+    }
+    Ok(())
 }
 
 async fn default_action(client: &UnixRpcClient, config: Option<PathBuf>) -> Result<(), CliError> {
@@ -540,7 +594,7 @@ fn append_hook_debug_log(
 
 fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
     if socket.exists() {
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        if daemon_socket_accepts(socket) {
             return Ok(());
         }
         eprintln!("Removing stale socket {}", socket.display());
@@ -610,7 +664,7 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if socket.exists() && std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        if socket.exists() && daemon_socket_accepts(socket) {
             eprintln!("ahd daemon ready.");
             return Ok(());
         }
@@ -620,6 +674,16 @@ fn ensure_daemon_running(socket: &Path) -> Result<(), CliError> {
         "ahd failed to start within 10s (socket {} not accepting connections)",
         socket.display()
     )))
+}
+
+#[cfg(unix)]
+fn daemon_socket_accepts(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+#[cfg(windows)]
+fn daemon_socket_accepts(_socket: &Path) -> bool {
+    false
 }
 
 fn run_transient_systemd_bootstrap(
@@ -730,6 +794,21 @@ fn resolve_master_attach_session_name(
     sessions: Option<&Value>,
     session_id: Option<&str>,
 ) -> Result<String, CliError> {
+    let session = resolve_master_session(sessions, session_id)?;
+    let project_id = session
+        .get("project_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::InvalidResponse("session.list session missing project_id".into())
+        })?;
+    Ok(master_session_name(project_id))
+}
+
+fn resolve_master_session<'a>(
+    sessions: Option<&'a Value>,
+    session_id: Option<&str>,
+) -> Result<&'a Value, CliError> {
     let sessions = sessions
         .and_then(|value| value.get("sessions"))
         .and_then(Value::as_array)
@@ -776,14 +855,239 @@ fn resolve_master_attach_session_name(
             "session {id} has no master pane; run `ah start` with master enabled first"
         )));
     }
-    let project_id = session
-        .get("project_id")
+    Ok(session)
+}
+
+fn resolve_master_tell_target<'a>(
+    sessions: &'a Value,
+    session_id: Option<&str>,
+) -> Result<(&'a str, TmuxPaneId), CliError> {
+    let session = resolve_master_session(Some(sessions), session_id)?;
+    let session_id = session
+        .get("id")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::InvalidResponse("session.list session missing id".into()))?;
+    let pane_id = session
+        .get("master_pane_id")
+        .and_then(Value::as_str)
         .ok_or_else(|| {
-            CliError::InvalidResponse("session.list session missing project_id".into())
+            CliError::InvalidResponse("session.list session missing master_pane_id".into())
         })?;
-    Ok(master_session_name(project_id))
+    let pane = TmuxPaneId::parse(pane_id)
+        .map_err(|err| CliError::Config(format!("stored master_pane_id is invalid: {err}")))?;
+    Ok((session_id, pane))
+}
+
+fn generated_tell_request_id() -> String {
+    format!(
+        "tell_{}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+const PASTE_EXPAND_GUARDS: &[&str] = &["paste again to expand"];
+
+fn bottom_composer_region(capture: &str) -> String {
+    let mut lines = capture.lines().rev().take(8).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n").to_ascii_lowercase()
+}
+
+fn contains_paste_expand_guard(capture: &str) -> bool {
+    let bottom = bottom_composer_region(capture);
+    PASTE_EXPAND_GUARDS
+        .iter()
+        .any(|phrase| bottom.contains(phrase))
+}
+
+fn bottom_contains_tell_body(capture: &str, text: &str) -> bool {
+    let needle = text.trim();
+    !needle.is_empty() && bottom_composer_region(capture).contains(&needle.to_ascii_lowercase())
+}
+
+async fn report_master_tell_failed(
+    client: &UnixRpcClient,
+    session_id: &str,
+    request_id: &str,
+    pane_id: &str,
+    stage: &str,
+    reason: &str,
+) {
+    let _ = client
+        .call(
+            "master.tell_failed",
+            json!({
+                "session_id": session_id,
+                "request_id": request_id,
+                "pane_id": pane_id,
+                "stage": stage,
+                "reason": reason,
+            }),
+        )
+        .await;
+}
+
+async fn cmd_tell(
+    client: &UnixRpcClient,
+    target: String,
+    text: String,
+    session: Option<String>,
+    request_id: Option<String>,
+) -> Result<(), CliError> {
+    if target != "master" {
+        return Err(CliError::Config(
+            "usage: ah tell master <text> [--session <session_id>] [--request-id <id>]".into(),
+        ));
+    }
+    let sessions = client.call("session.list", json!({})).await?;
+    let (session_id, pane) = resolve_master_tell_target(&sessions, session.as_deref())?;
+    let request_id = request_id.unwrap_or_else(generated_tell_request_id);
+    client
+        .call(
+            "master.tell_begin",
+            json!({
+                "session_id": session_id,
+                "request_id": request_id,
+                "pane_id": pane.0,
+            }),
+        )
+        .await?;
+
+    let state_dir = client
+        .socket()
+        .parent()
+        .ok_or_else(|| CliError::Config("daemon socket has no parent directory".into()))?;
+    let tmux = TmuxServer::new(state_dir);
+    let buffer_name = format!("ah-tell-{}", request_id.replace([':', '/', '.'], "_"));
+    let pane_id = pane.0.clone();
+
+    if let Err(err) = tmux.load_buffer(buffer_name.clone(), text.clone()).await {
+        report_master_tell_failed(
+            client,
+            session_id,
+            &request_id,
+            &pane_id,
+            "LOAD_BUFFER",
+            &err.to_string(),
+        )
+        .await;
+        return Err(CliError::Config(format!(
+            "DELIVERY_FAILED request_id={request_id} stage=LOAD_BUFFER reason={err}"
+        )));
+    }
+    let paste_result = tmux.paste_buffer(pane.clone(), buffer_name.clone()).await;
+    let _ = tmux.delete_buffer(buffer_name).await;
+    if let Err(err) = paste_result {
+        report_master_tell_failed(
+            client,
+            session_id,
+            &request_id,
+            &pane_id,
+            "PASTE",
+            &err.to_string(),
+        )
+        .await;
+        return Err(CliError::Config(format!(
+            "DELIVERY_FAILED request_id={request_id} stage=PASTE reason={err}"
+        )));
+    }
+    if let Err(err) = tmux
+        .send_keys_keysym(pane.clone(), "Enter".to_string())
+        .await
+    {
+        report_master_tell_failed(
+            client,
+            session_id,
+            &request_id,
+            &pane_id,
+            "PASTE_ENTER",
+            &err.to_string(),
+        )
+        .await;
+        return Err(CliError::Config(format!(
+            "DELIVERY_FAILED request_id={request_id} stage=PASTE_ENTER reason={err}"
+        )));
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    match tmux.capture_pane(pane.clone()).await {
+        Ok(capture) if contains_paste_expand_guard(&capture) => {
+            if let Err(err) = tmux
+                .send_keys_keysym(pane.clone(), "Enter".to_string())
+                .await
+            {
+                report_master_tell_failed(
+                    client,
+                    session_id,
+                    &request_id,
+                    &pane_id,
+                    "SEND_ENTER_TO_EXPAND",
+                    &err.to_string(),
+                )
+                .await;
+                return Err(CliError::Config(format!(
+                    "DELIVERY_FAILED request_id={request_id} stage=SEND_ENTER_TO_EXPAND reason={err}"
+                )));
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            report_master_tell_failed(
+                client,
+                session_id,
+                &request_id,
+                &pane_id,
+                "DETECT_EXPAND_PROMPT",
+                &err.to_string(),
+            )
+            .await;
+            return Err(CliError::Config(format!(
+                "DELIVERY_FAILED request_id={request_id} stage=DETECT_EXPAND_PROMPT reason={err}"
+            )));
+        }
+    }
+
+    let mut last_reason = "composer_not_cleared".to_string();
+    for _ in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        match tmux.capture_pane(pane.clone()).await {
+            Ok(capture) => {
+                if contains_paste_expand_guard(&capture) {
+                    last_reason = "paste_expand_prompt_still_visible".to_string();
+                    continue;
+                }
+                if bottom_contains_tell_body(&capture, &text) {
+                    last_reason = "tell_body_still_visible_in_composer".to_string();
+                    continue;
+                }
+                println!(
+                    "delivered request_id={request_id}; waiting for master UserPromptSubmit/Stop hooks is observable via ah ps/logs"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                last_reason = err.to_string();
+                break;
+            }
+        }
+    }
+
+    report_master_tell_failed(
+        client,
+        session_id,
+        &request_id,
+        &pane_id,
+        "VERIFY_PANE_CLEARED",
+        &last_reason,
+    )
+    .await;
+    Err(CliError::Config(format!(
+        "DELIVERY_FAILED_UNCONFIRMED request_id={request_id} stage=VERIFY_PANE_CLEARED reason={last_reason}"
+    )))
 }
 
 async fn cmd_attach(
@@ -846,9 +1150,9 @@ async fn cmd_ps(client: &UnixRpcClient) -> Result<(), CliError> {
     print_tmux_hint(client.socket())
 }
 
-async fn cmd_doctor(client: &UnixRpcClient) -> Result<(), CliError> {
-    let cwd = std::env::current_dir()?;
-    let checks = run_doctor(client, &cwd).await?;
+async fn cmd_doctor(client: &UnixRpcClient, config_path: Option<&Path>) -> Result<(), CliError> {
+    let project_dir = config_path.and_then(|path| path.parent());
+    let checks = run_doctor(client, project_dir).await?;
     print_doctor(&checks);
     if has_failures(&checks) {
         Err(CliError::Config("doctor found failed checks".into()))
@@ -1021,18 +1325,30 @@ async fn wait_for_job(client: &UnixRpcClient, job_id: &str) -> Result<Value, Cli
 }
 
 fn tmux_socket_path_from_daemon_socket(socket: &Path) -> Result<PathBuf, CliError> {
-    let state_dir = socket.parent().ok_or_else(|| {
-        CliError::InvalidResponse(format!(
-            "socket path has no parent directory: {}",
-            socket.display()
-        ))
-    })?;
-    let socket_name = compute_socket_name(state_dir);
-    Ok(PathBuf::from(format!(
-        "/tmp/tmux-{}/{}",
-        unsafe { libc::geteuid() },
-        socket_name
-    )))
+    #[cfg(windows)]
+    {
+        let _ = socket;
+        return Err(CliError::InvalidResponse(
+            "Windows attach is not implemented until the ConPTY multiplexer attach path exists"
+                .to_string(),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let state_dir = socket.parent().ok_or_else(|| {
+            CliError::InvalidResponse(format!(
+                "socket path has no parent directory: {}",
+                socket.display()
+            ))
+        })?;
+        let socket_name = compute_socket_name(state_dir);
+        Ok(PathBuf::from(format!(
+            "/tmp/tmux-{}/{}",
+            unsafe { libc::geteuid() },
+            socket_name
+        )))
+    }
 }
 
 fn prepare_attach_command(socket: &Path, session_name: &str) -> Vec<String> {
@@ -1047,17 +1363,30 @@ fn prepare_attach_command(socket: &Path, session_name: &str) -> Vec<String> {
 }
 
 fn exec_tmux_attach(socket: PathBuf, session_name: String) -> ! {
-    use std::os::unix::process::CommandExt;
-    let cmd = prepare_attach_command(&socket, &session_name);
-    let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
-    eprintln!("exec tmux attach failed: {err}");
-    std::process::exit(1);
+    #[cfg(windows)]
+    {
+        let _ = (socket, session_name);
+        eprintln!(
+            "Windows attach is not implemented until the ConPTY multiplexer attach path exists"
+        );
+        std::process::exit(1);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let cmd = prepare_attach_command(&socket, &session_name);
+        let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
+        eprintln!("exec tmux attach failed: {err}");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Cmd, MasterCmd, attach_session_name, detect_nesting, format_agent_notify_output,
+        Cli, Cmd, MasterCmd, attach_session_name, bottom_contains_tell_body,
+        contains_paste_expand_guard, detect_nesting, format_agent_notify_output,
         prepare_attach_command, resolve_attach_session_name,
     };
     use clap::Parser;
@@ -1137,6 +1466,35 @@ mod tests {
                 assert_eq!(socket.as_deref(), Some(Path::new("/tmp/ahd.sock")));
             }
             _ => panic!("expected agent notify command"),
+        }
+    }
+
+    #[test]
+    fn ah_cli_parses_tell_master_command() {
+        let cli = Cli::parse_from([
+            "ah",
+            "tell",
+            "master",
+            "do this",
+            "--session",
+            "s1",
+            "--request-id",
+            "tell_1",
+        ]);
+
+        match cli.cmd {
+            Some(Cmd::Tell {
+                target,
+                text,
+                session,
+                request_id,
+            }) => {
+                assert_eq!(target, "master");
+                assert_eq!(text, "do this");
+                assert_eq!(session.as_deref(), Some("s1"));
+                assert_eq!(request_id.as_deref(), Some("tell_1"));
+            }
+            _ => panic!("expected tell command"),
         }
     }
 
@@ -1239,6 +1597,21 @@ mod tests {
             err.to_string().contains("master pane"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn tell_verify_ignores_historical_body_outside_bottom_composer() {
+        let capture =
+            "old prompt body\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\n  >";
+
+        assert!(!bottom_contains_tell_body(capture, "old prompt body"));
+    }
+
+    #[test]
+    fn tell_verify_detects_guard_in_bottom_composer() {
+        let capture = "transcript\n\npaste again to expand";
+
+        assert!(contains_paste_expand_guard(capture));
     }
 
     #[test]

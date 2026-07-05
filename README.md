@@ -104,6 +104,7 @@ ah ps
 ah start [--wait]
 ah up [--force]
 ah ask <agent_id> <text> [--wait] [--request-id <id>]
+ah tell master <text> [--session <session_id>] [--request-id <id>]
 ah pend <job_id>
 ah cancel <job_id>
 ah kill <target_id> [--session] [--force]

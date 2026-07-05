@@ -8,7 +8,7 @@ use std::path::Path;
 
 pub use error::TmuxError;
 pub use pane::TmuxPaneId;
-pub use session::TmuxServer;
+pub use session::{TmuxServer, TmuxWindowSize};
 
 pub fn agent_session_name(agent_id: &str) -> String {
     format!("agent_{agent_id}")
@@ -42,7 +42,7 @@ pub fn compute_socket_name(state_dir: &Path) -> String {
     format!("ahd-{}", &hex[..16])
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{TmuxServer, agent_session_name, compute_socket_name, master_session_name};
     use crate::tmux::pane::TmuxPaneId;

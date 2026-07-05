@@ -14,7 +14,9 @@ pub(crate) use ack::{
     ACK_IDLE_SCAN_REOPEN_DELAY_MS, CAPTURE_SEED_POLL_MS, CAPTURE_SEED_STABILITY_MS,
     spawn_new_capture_seed,
 };
-pub use ack::{fallback_ack_to_crashed, fallback_ack_to_stuck};
+pub use ack::{
+    AckBusyOutcome, ack_mark_busy_or_resolve, fallback_ack_to_crashed, fallback_ack_to_stuck,
+};
 pub use agent::{
     handle_agent_kill, handle_agent_notify, handle_agent_read, handle_agent_send,
     handle_agent_spawn, handle_agent_watch,
@@ -29,12 +31,13 @@ pub use prompt::{handle_agent_learn_rule, handle_agent_resolve_prompt};
 pub(crate) use realign::{RealignAgentParams, spawn_realign_agent};
 pub use realign::{handle_agent_realign, handle_session_realign};
 pub use sessions::{
-    handle_master_ack_ready, handle_session_create, handle_session_kill, handle_session_list,
-    handle_session_master_cutover, handle_session_spawn_master_pane,
+    handle_master_ack_ready, handle_master_tell_begin, handle_master_tell_failed,
+    handle_session_create, handle_session_kill, handle_session_list, handle_session_master_cutover,
+    handle_session_spawn_master_pane,
 };
 pub use system::{handle_system_dump, handle_system_shutdown};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::ack::capture_seed_matches;
     use super::events::stuck_frame_for_filter;
