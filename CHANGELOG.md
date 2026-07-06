@@ -4,6 +4,49 @@ All notable changes to `ah` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [1.3.4] - 2026-07-06
+
+### Added
+- `ah events` runtime snapshots now include a `starting` runtime_state for the
+  cold-start window before master/worker tmux runtime has been recorded.
+  Consumers such as Studio should clean up only `degraded` runtimes; `starting`
+  means startup is still in progress and must be left alone.
+
+### Fixed
+- Claude workers spawned into an ah sandbox HOME with
+  `--dangerously-skip-permissions` now receive `IS_SANDBOX=1` directly from the
+  daemon's provider spawn path, so sandbox identity no longer depends on the
+  harness config template carrying a duplicate `[env] IS_SANDBOX` entry.
+
+## [1.3.3] - 2026-07-06
+
+### Fixed
+- `ah events` no longer exits when the daemon closes the subscription stream
+  (`ah stop` or a daemon restart). It now emits a local inactive snapshot so
+  consumers see the runtime go down, then keeps reconnecting — a GUI
+  supervisor would otherwise freeze on the last active snapshot. The local
+  fingerprint resets after a live connection so the down-edge is never
+  dedup-suppressed, while pure connect-failure loops stay quiet.
+
+## [1.3.2] - 2026-07-06
+
+### Added
+- `CLAUDE_CODE_OAUTH_TOKEN` joined the daemon env passthrough whitelist, so a
+  host launcher can hand a long-lived `claude setup-token` credential to the
+  daemon and every master/worker it spawns inherits it — without persisting
+  the token into config files, the sqlite inventory, or spawn-cmd logs.
+
+### Fixed
+- `ah events` no longer filters runtime inventory by the config file's parent
+  directory. Sessions record the project's absolute path (the `ah start`
+  cwd), while the config may live elsewhere (Studio keeps transient configs
+  under the OS temp dir), so the filter matched nothing and every snapshot
+  reported an inactive runtime even while master and workers were alive.
+  The daemon's state dir is already scoped to the config, so the
+  subscription reports that daemon's full inventory.
+
 ## [1.3.1] - 2026-07-06
 
 ### Added

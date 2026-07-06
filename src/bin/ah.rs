@@ -1334,16 +1334,39 @@ async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliEr
     let mut last_local_fingerprint = None::<String>;
 
     loop {
-        let params = json!({
-            "config_path": config_path.display().to_string(),
-            "workspace_path": workspace_path,
-        });
+        let params = runtime_subscribe_params(&config_path);
+        let mut streamed_this_connection = false;
         match rpc_stream_lines(&socket, "runtime.subscribe", params, |line| {
+            streamed_this_connection = true;
             println!("{line}");
             std::io::stdout().flush()?;
             Ok(())
         }) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // The daemon closed the stream — an `ah stop` or a daemon
+                // restart, both normal lifecycle events for a long-lived
+                // subscriber. Emit a local inactive snapshot so consumers see
+                // the runtime go down, then keep reconnecting instead of
+                // exiting (a GUI supervisor would otherwise freeze on the
+                // last active snapshot). Reset the local fingerprint: the
+                // last LOCAL snapshot predates the connection, and matching
+                // it would dedup away this down-edge.
+                if streamed_this_connection {
+                    last_local_fingerprint = None;
+                }
+                let snapshot = ah::runtime_events::inactive_runtime_snapshot(
+                    ah::runtime_events::RuntimeInactiveInput {
+                        reason: ah::runtime_events::RuntimeSnapshotReason::DaemonLost,
+                        config_path: Some(config_path.display().to_string()),
+                        workspace_path: Some(workspace_path.clone()),
+                        state_dir: state_dir.clone(),
+                        sequence,
+                    },
+                );
+                print_local_runtime_snapshot_if_changed(&snapshot, &mut last_local_fingerprint)?;
+                sequence = sequence.saturating_add(1);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             Err(CliError::DaemonNotRunning(_)) | Err(CliError::DaemonNotAccepting(_, _)) => {
                 let snapshot = ah::runtime_events::inactive_runtime_snapshot(
                     ah::runtime_events::RuntimeInactiveInput {
@@ -1359,6 +1382,9 @@ async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliEr
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Err(CliError::Io(_)) => {
+                if streamed_this_connection {
+                    last_local_fingerprint = None;
+                }
                 let snapshot = ah::runtime_events::inactive_runtime_snapshot(
                     ah::runtime_events::RuntimeInactiveInput {
                         reason: ah::runtime_events::RuntimeSnapshotReason::DaemonLost,
@@ -1375,6 +1401,18 @@ async fn cmd_events(config: Option<PathBuf>, format: String) -> Result<(), CliEr
             Err(err) => return Err(err),
         }
     }
+}
+
+/// The daemon's state dir is already derived from the config path, so the
+/// subscription must NOT filter sessions by workspace path: sessions record
+/// the project's absolute path (`ah start` cwd), while the config may live
+/// elsewhere entirely (Studio keeps transient configs under the OS temp dir).
+/// Sending the config's parent as `workspace_path` made the inventory filter
+/// match nothing, so every snapshot reported an inactive runtime.
+fn runtime_subscribe_params(config_path: &Path) -> Value {
+    json!({
+        "config_path": config_path.display().to_string(),
+    })
 }
 
 fn absolutize_path(cwd: &Path, path: PathBuf) -> PathBuf {
@@ -1488,7 +1526,7 @@ mod tests {
     use super::{
         Cli, Cmd, MasterCmd, attach_session_name, bottom_contains_tell_body,
         contains_paste_expand_guard, detect_nesting, format_agent_notify_output,
-        prepare_attach_command, resolve_attach_session_name,
+        prepare_attach_command, resolve_attach_session_name, runtime_subscribe_params,
     };
     use clap::Parser;
     use serde_json::json;
@@ -1584,6 +1622,20 @@ mod tests {
             }
             _ => panic!("expected events command"),
         }
+    }
+
+    #[test]
+    fn runtime_subscribe_params_do_not_filter_by_workspace() {
+        // The config parent is NOT the workspace (Studio keeps transient
+        // configs under the OS temp dir); filtering inventory by it made
+        // every snapshot report an inactive runtime.
+        let params = runtime_subscribe_params(Path::new("/tmp/skill-studio-ah/x/claude/ah.toml"));
+
+        assert_eq!(
+            params.get("config_path").and_then(|value| value.as_str()),
+            Some("/tmp/skill-studio-ah/x/claude/ah.toml")
+        );
+        assert!(params.get("workspace_path").is_none());
     }
 
     #[test]
