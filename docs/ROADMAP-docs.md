@@ -76,13 +76,18 @@ Today `examples/ah.toml` configures three bash agents, and `examples/scenarios/d
 - a **one-shot fan-out** script: spawn N isolated agents, one `ask` each, collect the N replies, tear down — the pattern for independent sampling / map-reduce over agents
 - consuming `ah events --format json` from another process
 
-### 6. Environment passthrough policy — docs plus a design decision
+### 6. Host-environment parity — docs plus a design decision
 
-ah spawns agents in systemd scopes with a controlled environment. That is the right default, but it silently drops `HTTP(S)_PROXY`/`NO_PROXY` — on proxy-only networks every provider loses egress, and the symptom (provider shows a login screen despite valid credentials) points users at auth instead of networking. Tasks:
+ah spawns agents in systemd scopes with a controlled environment. That is the right default, but the agent runtime can silently diverge from what the user's interactive shell sees. A host application's WSL provisioning script already mirrors **proxy, timezone, and locale** from Windows into WSL and notes these steps *"architecturally belong in ah"* — that judgment should be honored here. Parity dimensions, each observed in a real deployment:
 
-- document exactly which env vars an agent receives and where they come from (`[env]`, `[agents.<id>.env]`, injected identity vars)
-- consider first-class proxy passthrough: either inherit proxy vars by default or support a `[env] passthrough = [...]` list
-- until then, document the `[env]` workaround prominently in windows.md and providers.md
+- **Network proxy**: `HTTP(S)_PROXY`/`NO_PROXY` are not inherited by agent scopes → provider egress fails and presents as a fake login screen (observed). Either inherit proxy vars by default, or support a `[env] passthrough = [...]` list; until then document the `[env]` workaround prominently. Also document exactly which env vars an agent receives and where they come from (`[env]`, `[agents.<id>.env]`, injected identity vars).
+- **Timezone**: WSL's TZ is a static snapshot from provisioning time and does not track later Windows changes; agents stamp logs, commits, and token-expiry math in local time. Mirror Windows TZ → IANA (the host app ships a mapping table worth upstreaming) or at least detect mismatch.
+- **Locale/LANG**: affects CJK rendering inside panes (ah parses panes via vt100 — wide-character handling), file encodings, and tool output language. Mirror from the host or pin explicitly per agent.
+- **Clock drift**: WSL2's kernel clock skews after Windows sleep/hibernate; a long-running ahd plus agents then hit TLS "certificate not yet valid" and bogus token-expiry decisions. Detect skew (kernel time vs RTC/NTP) and suggest resync.
+- **PATH hygiene**: agent scopes currently inherit the Windows-appended PATH (`/mnt/c/...`); an agent resolving `python`/`node`/`git` to a Windows `.exe` silently escapes sandbox HOME injection. The existing `/mnt/*` guard covers only the provider binary — consider sanitizing PATH for agent scopes or extending the guard.
+- **DNS / certificates** (WSL specifics): `resolv.conf` regeneration vs VPN state; corporate/MITM proxy certs must be present in the WSL trust store for provider TLS to work.
+
+*Acceptance:* `ah doctor` reports parity mismatches (proxy, TZ, locale, clock skew, PATH) with concrete fix commands; `docs/windows.md` documents the parity contract.
 
 ### 7. Completion/terminality semantics — docs plus code cleanup
 
