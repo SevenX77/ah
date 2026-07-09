@@ -35,6 +35,7 @@ fn remove_env(key: &str) {
 fn clear_state_env() {
     for key in [
         "AH_STATE_DIR",
+        "CCBD_STATE_DIR",
         "XDG_STATE_HOME",
         "CCB_ENV",
         "CCB_SOCKET",
@@ -243,6 +244,7 @@ async fn pane_at_death_evidence_is_written_under_state_dir_not_relative_ccb() {
         AgentIoEntry {
             session_id: "s_pr1_pane_death".to_string(),
             pane_id: pane,
+            expected_pid: None,
             reader_handle,
             fifo_path,
             socket_name: server.socket_name().to_string(),
@@ -250,7 +252,7 @@ async fn pane_at_death_evidence_is_written_under_state_dir_not_relative_ccb() {
         },
     );
 
-    cleanup_agent_runtime_resources(agent_id);
+    cleanup_agent_runtime_resources(agent_id, Some("s_pr1_pane_death"));
     std::env::set_current_dir(original_cwd).unwrap();
 
     assert!(

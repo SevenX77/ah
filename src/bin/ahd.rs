@@ -1,11 +1,8 @@
 use ah::{
-    db, env,
+    cli, db, env,
     monitor::{master_watch, session_watch::unit_name_for_session},
-    orchestrator, rpc, sandbox, systemd_unit,
-    tmux::{
-        TmuxServer, agent_session_name, master_session_name,
-        scope::{self, ScopePolicy},
-    },
+    orchestrator, rpc, sandbox,
+    tmux::{TmuxServer, agent_session_name, master_session_name},
 };
 use std::io;
 use std::path::Path;
@@ -17,8 +14,43 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
+#[derive(Debug, PartialEq, Eq)]
+enum AhdCliAction {
+    RunDaemon,
+    PrintVersion,
+    PrintHelp,
+    UnknownFlag(String),
+}
+
+fn classify_ahd_args(args: &[String]) -> AhdCliAction {
+    match args.first().map(String::as_str) {
+        None => AhdCliAction::RunDaemon,
+        Some("--version" | "-V") => AhdCliAction::PrintVersion,
+        Some("--help" | "-h") => AhdCliAction::PrintHelp,
+        Some(flag) if flag.starts_with('-') => AhdCliAction::UnknownFlag(flag.to_string()),
+        Some(_) => AhdCliAction::RunDaemon,
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    match classify_ahd_args(&args) {
+        AhdCliAction::RunDaemon => {}
+        AhdCliAction::PrintVersion => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        AhdCliAction::PrintHelp => {
+            println!("Usage: ahd [--version|-V] [--help|-h]");
+            return ExitCode::SUCCESS;
+        }
+        AhdCliAction::UnknownFlag(flag) => {
+            eprintln!("unknown option: {flag}");
+            return ExitCode::from(2);
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -37,9 +69,10 @@ async fn main() -> ExitCode {
             "ahd not running under systemd; cascade cleanup will rely on Startup Reconcile only"
         );
     }
-    let daemon_unit = systemd_unit::detect_current_service_unit();
-
     let dir = env::resolve_state_dir();
+    let daemon_unit = ah::platform::sys::scope::active_daemon_unit_or_none(Some(
+        cli::service_unit::derive_unit_name(&dir),
+    ));
     tracing::info!(?dir, "ahd starting");
     if let Err(err) = migrate_legacy_db_files(&dir) {
         tracing::error!(?dir, error = %err, "legacy database migration failed");
@@ -211,10 +244,6 @@ fn cleanup_session_anchors(ctx: &rpc::Ctx) {
 fn shutdown_session_anchors_enabled(ctx: &rpc::Ctx) -> bool {
     ctx.env_state.systemd_run_available
         && (ctx.env_state.unsafe_no_sandbox || ctx.env_state.under_systemd)
-        && matches!(
-            scope::detect_scope_policy(ctx.tmux_server.socket_name()),
-            ScopePolicy::Systemd(_)
-        )
 }
 
 fn shutdown_anchor_unit_names(ctx: &rpc::Ctx) -> Vec<String> {
@@ -333,13 +362,34 @@ fn run_tmux_cleanup_command(result: io::Result<std::process::Output>, label: &st
 
 #[cfg(test)]
 mod tests {
-    use super::shutdown_anchor_unit_names;
+    use super::{classify_ahd_args, shutdown_anchor_unit_names, AhdCliAction};
     use ah::db;
     use ah::monitor::session_watch::unit_name_for_session;
     use ah::rpc;
     use ah::sandbox::EnvState;
     use ah::tmux::TmuxServer;
     use std::sync::Arc;
+
+    #[test]
+    fn classify_ahd_args_handles_non_daemon_cli_actions() {
+        assert_eq!(
+            classify_ahd_args(&["--version".to_string()]),
+            AhdCliAction::PrintVersion
+        );
+        assert_eq!(
+            classify_ahd_args(&["-V".to_string()]),
+            AhdCliAction::PrintVersion
+        );
+        assert_eq!(
+            classify_ahd_args(&["--help".to_string()]),
+            AhdCliAction::PrintHelp
+        );
+        assert_eq!(
+            classify_ahd_args(&["--bogus".to_string()]),
+            AhdCliAction::UnknownFlag("--bogus".to_string())
+        );
+        assert_eq!(classify_ahd_args(&[]), AhdCliAction::RunDaemon);
+    }
 
     #[test]
     fn test_shutdown_anchor_unit_names_lists_active_session_anchors_only() {

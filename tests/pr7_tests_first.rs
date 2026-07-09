@@ -47,6 +47,7 @@ fn fixture_project_config() -> ProjectConfig {
             plugins: Vec::new(),
             skills: Vec::new(),
             bundle: Vec::new(),
+            settings: serde_json::Map::new(),
         },
     );
     ProjectConfig {
@@ -160,6 +161,7 @@ fn register_agent_io_entry(
         AgentIoEntry {
             session_id: session_id.to_string(),
             pane_id: TmuxPaneId("%1".to_string()),
+            expected_pid: None,
             reader_handle: tokio::spawn(async { future::pending::<()>().await }),
             fifo_path: fifo_path.clone(),
             socket_name: "missing-socket".to_string(),
@@ -418,6 +420,7 @@ async fn pr7_runtime_cleanup_preserves_recoverable_crashed_home_but_removes_fifo
         AgentIoEntry {
             session_id: "s1".to_string(),
             pane_id: TmuxPaneId("%1".to_string()),
+            expected_pid: None,
             reader_handle: tokio::spawn(async { future::pending::<()>().await }),
             fifo_path: fifo_path.clone(),
             socket_name: "missing-socket".to_string(),
@@ -427,6 +430,7 @@ async fn pr7_runtime_cleanup_preserves_recoverable_crashed_home_but_removes_fifo
 
     cleanup_agent_runtime_resources_with_policy(
         "a1",
+        Some("s1"),
         RuntimeCleanupPolicy::PreserveRecoverableCrashedHome,
     );
 
@@ -474,7 +478,13 @@ async fn pr7_agent_watch_crash_path_preserves_codex_recoverable_home() {
     let pidfd = pidfd_open(pid).unwrap();
     let task_fd = pidfd.try_clone().unwrap();
 
-    spawn_agent_pidfd_watch_task(agent_id.clone(), pid, task_fd, Arc::new(db.clone()));
+    spawn_agent_pidfd_watch_task(
+        agent_id.clone(),
+        "s1".to_string(),
+        pid,
+        task_fd,
+        Arc::new(db.clone()),
+    );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
     });
@@ -521,7 +531,13 @@ async fn pr7_agent_watch_crash_path_deletes_bash_home() {
     let pidfd = pidfd_open(pid).unwrap();
     let task_fd = pidfd.try_clone().unwrap();
 
-    spawn_agent_pidfd_watch_task(agent_id.clone(), pid, task_fd, Arc::new(db.clone()));
+    spawn_agent_pidfd_watch_task(
+        agent_id.clone(),
+        "s1".to_string(),
+        pid,
+        task_fd,
+        Arc::new(db.clone()),
+    );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
     });
@@ -567,7 +583,13 @@ async fn pr7_agent_watch_killed_path_deletes_codex_home() {
     let pidfd = pidfd_open(pid).unwrap();
     let task_fd = pidfd.try_clone().unwrap();
 
-    spawn_agent_pidfd_watch_task(agent_id.clone(), pid, task_fd, Arc::new(db.clone()));
+    spawn_agent_pidfd_watch_task(
+        agent_id.clone(),
+        "s1".to_string(),
+        pid,
+        task_fd,
+        Arc::new(db.clone()),
+    );
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
     });

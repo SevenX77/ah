@@ -17,7 +17,7 @@ use ah::rpc::handlers::{
 };
 use ah::sandbox::EnvState;
 use ah::tmux::{TmuxServer, agent_session_name, compute_socket_name};
-use common::scope_policy_for_test;
+use common::{DaemonIdentityEnvGuard, scope_policy_for_test};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 struct Harness {
     ctx: Ctx,
+    _env_guard: DaemonIdentityEnvGuard,
     _state_dir: tempfile::TempDir,
     _db_file: tempfile::NamedTempFile,
 }
@@ -34,6 +35,7 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         which::which("tmux").expect("tmux binary required for mvp9 acceptance tests");
+        let env_guard = DaemonIdentityEnvGuard::scrub();
         let db_file = tempfile::NamedTempFile::new().unwrap();
         let state_dir = tempfile::TempDir::new().unwrap();
         let state_dir_path = state_dir.path().to_path_buf();
@@ -53,6 +55,7 @@ impl Harness {
 
         Self {
             ctx,
+            _env_guard: env_guard,
             _state_dir: state_dir,
             _db_file: db_file,
         }
@@ -341,6 +344,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             plugins: Default::default(),
             skills: Default::default(),
             bundle: Default::default(),
+            settings: Default::default(),
         },
     );
     let config = ProjectConfig {
@@ -355,6 +359,7 @@ async fn test_launcher_passes_merged_env_to_agent_spawn() {
             plugins: Default::default(),
             skills: Default::default(),
             bundle: Default::default(),
+            settings: Default::default(),
         },
         completion: Default::default(),
         daemon: Default::default(),
@@ -455,21 +460,38 @@ async fn test_session_kill_cleans_prompt_pending_agent_session_without_force() {
     .unwrap();
     let session_id = session["session_id"].as_str().unwrap().to_string();
     let agent_id = "ag_kill_prompt_pending";
+    h.ctx
+        .tmux_server
+        .ensure_session(agent_session_name(agent_id), h.ctx.state_dir.clone())
+        .await
+        .unwrap();
+    let pane_pid = Command::new("tmux")
+        .args([
+            "-L",
+            h.ctx.tmux_server.socket_name(),
+            "display-message",
+            "-p",
+            "-t",
+            &agent_session_name(agent_id),
+            "#{pane_pid}",
+        ])
+        .output()
+        .unwrap();
+    assert!(pane_pid.status.success());
+    let pane_pid = String::from_utf8_lossy(&pane_pid.stdout)
+        .trim()
+        .parse::<i64>()
+        .unwrap();
     ah::db::agents::insert_agent(
         h.ctx.db.clone(),
         agent_id.to_string(),
         session_id.clone(),
         "bash".to_string(),
         "PROMPT_PENDING".to_string(),
-        Some(123),
+        Some(pane_pid),
     )
     .await
     .unwrap();
-    h.ctx
-        .tmux_server
-        .ensure_session(agent_session_name(agent_id), h.ctx.state_dir.clone())
-        .await
-        .unwrap();
 
     let result = handle_session_kill(
         json!({
@@ -884,6 +906,7 @@ async fn test_antigravity_cancel_dispatched_sends_escape() {
         ah::agent_io::AgentIoEntry {
             session_id: session_id.clone(),
             pane_id: pane.clone(),
+            expected_pid: None,
             reader_handle,
             fifo_path,
             socket_name: h.ctx.tmux_server.socket_name().to_string(),

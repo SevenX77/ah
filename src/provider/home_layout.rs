@@ -1,5 +1,5 @@
 use crate::error::CcbdError;
-use crate::provider::builtin;
+use crate::provider::builtin::{self, BuiltinSkillScope};
 use crate::provider::extensions::{
     ExtensionConfig, HookGroup, HookItem, McpServerConfig, McpTransport,
 };
@@ -219,9 +219,9 @@ fn prepare_claude_overrides(
         &extensions.rules,
     )?;
     materialize_trust(source_home, &layout, workspace_key)?;
-    let mut skills = resolve_skills(project_root, &extensions.skills)?;
-    skills.extend(extensions.resolved_skills.iter().cloned());
+    let skills = resolve_provider_skills(project_root, extensions)?;
     materialize_claude_skills(&layout, &skills)?;
+    materialize_builtin_skills(&layout.claude_dir.join("skills"), role)?;
     let plugins = resolve_plugins_for_provider("claude", source_home, &extensions.plugins)?;
     materialize_claude_plugins(&layout, &plugins)?;
     let mut hook_specs = materialize_claude_hooks(source_home, &layout, &extensions.hooks)?;
@@ -232,7 +232,13 @@ fn prepare_claude_overrides(
         hook_specs.push(materialized_ah_hook(ctx, "Stop"));
     }
     materialize_claude_mcp(&layout, workspace_key, &extensions.mcp)?;
-    materialize_claude_settings(source_home, &layout, &hook_specs, &plugins)?;
+    materialize_claude_settings(
+        source_home,
+        &layout,
+        &extensions.settings,
+        &hook_specs,
+        &plugins,
+    )?;
     link_credentials(source_home, &layout);
 
     Ok(HomeOverrides {
@@ -286,9 +292,9 @@ fn prepare_antigravity_overrides(
             err,
         )
     })?;
-    let mut skills = resolve_skills(project_root, &extensions.skills)?;
-    skills.extend(extensions.resolved_skills.iter().cloned());
+    let skills = resolve_provider_skills(project_root, extensions)?;
     materialize_antigravity_skills(&layout, &skills)?;
+    materialize_builtin_skills(&layout.skills_dir, role)?;
     ensure_json_file(&layout.settings_path)?;
     materialize_antigravity_settings(source_home, &layout, workspace_key)?;
     materialize_antigravity_onboarding(source_home, &layout)?;
@@ -737,6 +743,45 @@ fn resolve_skills(project_root: &Path, skills: &[String]) -> Result<Vec<Resolved
     resolve_project_skills(project_root, &refs)
 }
 
+fn resolve_provider_skills(
+    project_root: &Path,
+    extensions: &ExtensionConfig,
+) -> Result<Vec<ResolvedSkill>, CcbdError> {
+    reject_builtin_skill_names(
+        extensions.skills.iter().map(String::as_str),
+        "project skill",
+    )?;
+    let mut skills = resolve_skills(project_root, &extensions.skills)?;
+    reject_builtin_skill_names(
+        extensions
+            .resolved_skills
+            .iter()
+            .map(|skill| skill.name.as_str()),
+        "bundle skill",
+    )?;
+    skills.extend(extensions.resolved_skills.iter().cloned());
+    Ok(skills)
+}
+
+fn reject_builtin_skill_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    source: &str,
+) -> Result<(), CcbdError> {
+    for name in names {
+        if builtin::BUILTIN_SKILLS
+            .iter()
+            .any(|skill| skill.name == name)
+        {
+            return Err(CcbdError::EnvironmentNotSupported {
+                details: format!(
+                    "skill name {name:?} is reserved by an ah builtin skill; rename the {source}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn materialize_claude_skills(
     layout: &ClaudeHomeLayout,
     skills: &[ResolvedSkill],
@@ -760,6 +805,41 @@ fn materialize_antigravity_skills(
 ) -> Result<(), CcbdError> {
     for skill in skills {
         force_symlink(&skill.source_dir, &layout.skills_dir.join(&skill.name))?;
+    }
+    Ok(())
+}
+
+fn materialize_builtin_skills(skills_dir: &Path, role: HomeLayoutRole) -> Result<(), CcbdError> {
+    let skills: Vec<_> = builtin::BUILTIN_SKILLS
+        .iter()
+        .filter(|skill| match skill.scope {
+            BuiltinSkillScope::MasterOnly => role == HomeLayoutRole::Master,
+            BuiltinSkillScope::AllAgents => true,
+        })
+        .collect();
+    if skills.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(skills_dir)
+        .map_err(|err| home_err("create builtin skills dir", skills_dir, err))?;
+    for skill in skills {
+        let skill_dir = skills_dir.join(skill.name);
+        if let Ok(metadata) = fs::symlink_metadata(&skill_dir) {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(&skill_dir).map_err(|err| {
+                    home_err("remove existing builtin skill path", &skill_dir, err)
+                })?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(&skill_dir).map_err(|err| {
+                    home_err("remove existing builtin skill dir", &skill_dir, err)
+                })?;
+            }
+        }
+        fs::create_dir_all(&skill_dir)
+            .map_err(|err| home_err("create builtin skill dir", &skill_dir, err))?;
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(&skill_md, skill.skill_md)
+            .map_err(|err| home_err("write builtin skill", &skill_md, err))?;
     }
     Ok(())
 }
@@ -812,11 +892,13 @@ fn materialize_hooks(
 fn materialize_claude_settings(
     _source_home: &Path,
     layout: &ClaudeHomeLayout,
+    provider_settings: &Map<String, Value>,
     hooks: &[MaterializedHook],
     plugins: &[ResolvedPlugin],
 ) -> Result<(), CcbdError> {
     ensure_json_file(&layout.settings_path)?;
     let mut settings = read_json_object(&layout.settings_path).unwrap_or_default();
+    merge_provider_settings(&mut settings, provider_settings);
     settings.insert(
         "skipDangerousModePermissionPrompt".to_string(),
         Value::Bool(true),
@@ -835,6 +917,22 @@ fn materialize_claude_settings(
         enabled_plugins.insert(plugin.name.clone(), Value::Bool(true));
     }
     write_json_object(&layout.settings_path, &settings)
+}
+
+fn merge_provider_settings(
+    settings: &mut Map<String, Value>,
+    provider_settings: &Map<String, Value>,
+) {
+    for (key, value) in provider_settings {
+        match (settings.get_mut(key), value) {
+            (Some(Value::Object(existing)), Value::Object(incoming)) => {
+                merge_provider_settings(existing, incoming);
+            }
+            _ => {
+                settings.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }
 
 fn inject_claude_hooks(settings: &mut Map<String, Value>, hooks: &[MaterializedHook]) {
@@ -928,9 +1026,9 @@ fn prepare_managed_codex_home(
             .map_err(|err| home_err("write codex config", &target_config, err))?;
     }
     ensure_codex_workspace_trust(&target_config, workspace_key)?;
-    let mut skills = resolve_skills(project_root, &extensions.skills)?;
-    skills.extend(extensions.resolved_skills.iter().cloned());
+    let skills = resolve_provider_skills(project_root, extensions)?;
     materialize_codex_skills(codex_home, &skills)?;
+    materialize_builtin_skills(&codex_home.join("skills"), role)?;
     let plugins = resolve_plugins_for_provider("codex", source_home, &extensions.plugins)?;
     materialize_codex_plugins(codex_home, &plugins)?;
     enable_codex_plugins(&target_config, &plugins)?;
@@ -2358,6 +2456,61 @@ mod tests {
         .unwrap();
 
         let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+        assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn claude_settings_merge_provider_settings_from_extensions() {
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides, read_json_object};
+        use serde_json::{Map, Value, json};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let target_claude = target.path().join(".claude");
+        std::fs::create_dir_all(&target_claude).unwrap();
+        std::fs::write(
+            target_claude.join("settings.json"),
+            r#"{"existing":"keep","statusLine":{"padding":1}}"#,
+        )
+        .unwrap();
+
+        let mut settings = Map::new();
+        settings.insert(
+            "model".to_string(),
+            Value::String("claude-opus-4-20250514".to_string()),
+        );
+        settings.insert("autoCompact".to_string(), Value::Bool(false));
+        settings.insert(
+            "statusLine".to_string(),
+            json!({"type":"command","command":"ah ps --format compact"}),
+        );
+        let extensions = ExtensionConfig {
+            settings,
+            ..Default::default()
+        };
+
+        prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            workspace.path(),
+            HomeLayoutRole::Master,
+            "master",
+            &extensions,
+            None,
+        )
+        .unwrap();
+
+        let settings = read_json_object(&target_claude.join("settings.json")).unwrap();
+        assert_eq!(settings["existing"], "keep");
+        assert_eq!(settings["model"], "claude-opus-4-20250514");
+        assert_eq!(settings["autoCompact"], false);
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(settings["statusLine"]["command"], "ah ps --format compact");
+        assert_eq!(settings["statusLine"]["padding"], 1);
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
     }

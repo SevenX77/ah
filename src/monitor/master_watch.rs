@@ -612,7 +612,7 @@ async fn revive_master_after_exit_windowed(
         "master death worker cleanup completed"
     );
     if snapshot.classification == MasterDeathSessionActivity::IdleNoWork {
-        mark_session_failed_after_idle_master_death(&db, &session_id)?;
+        mark_session_closed_after_idle_master_death(&db, &session_id)?;
         mark_master_recovery_phase(&db, &session_id, expected_generation, "FAILED", unixepoch())?;
         tracing::info!(
             session_id = %session_id,
@@ -772,6 +772,7 @@ async fn revive_master_after_exit_windowed(
     let master_session = master_session_name(&session.project_id);
     let mut master_env_vars = HashMap::new();
     master_env_vars.insert("AH_STATE_DIR".to_string(), state_dir.display().to_string());
+    crate::process_identity::inject_master_identity(&mut master_env_vars, &session_id);
     master_env_vars.insert(
         "CCB_SOCKET".to_string(),
         state_dir.join("ahd.sock").display().to_string(),
@@ -1281,16 +1282,21 @@ async fn reap_failed_revive_master_best_effort(
     reap_failed_revive_master_process_and_watch_best_effort(session_id, master_pid, generation);
 
     let pane_label = pane.0.clone();
-    if let Err(err) =
-        kill_failed_revive_master_pane(ctx.tmux_server.as_ref(), session_id, pane, generation).await
+    if !kill_failed_revive_master_pane(
+        ctx.tmux_server.as_ref(),
+        session_id,
+        pane,
+        master_pid,
+        generation,
+    )
+    .await
     {
-        tracing::warn!(
+        tracing::debug!(
             session_id,
             master_pid,
             generation,
             pane = %pane_label,
-            error = %err,
-            "failed to kill failed revived master pane"
+            "failed revived master pane was not killed"
         );
     }
 }
@@ -1411,8 +1417,9 @@ async fn kill_failed_revive_master_pane(
     tmux_server: &TmuxServer,
     session_id: &str,
     pane: &TmuxPaneId,
+    expected_pid: i64,
     generation: i64,
-) -> Result<(), CcbdError> {
+) -> bool {
     if record_failed_revive_master_reap_event(
         session_id,
         FailedReviveMasterReapEvent::PaneKill {
@@ -1420,9 +1427,11 @@ async fn kill_failed_revive_master_pane(
             generation,
         },
     ) {
-        return Ok(());
+        return true;
     }
-    tmux_server.kill_pane(pane.clone()).await
+    tmux_server
+        .kill_pane_if_owned(pane.clone(), expected_pid)
+        .await
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1941,12 +1950,12 @@ fn mark_master_recovery_non_revive_terminal(
     mark_master_recovery_phase(db, session_id, expected_generation, "FAILED", now)
 }
 
-fn mark_session_failed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
+fn mark_session_closed_after_idle_master_death(db: &Db, session_id: &str) -> Result<(), CcbdError> {
     let conn = db.conn();
     let changes = conn
         .execute(
             "UPDATE sessions
-         SET status = 'FAILED',
+         SET status = 'CLOSED',
              master_state = 'IDLE',
              master_pending_tell_request = NULL,
              master_last_exit_reason = 'IDLE_MASTER_EXIT'
@@ -2004,6 +2013,7 @@ async fn reprovision_declared_workers_after_master_revive(
             plugins: stored.spec.plugins.clone(),
             skills: stored.spec.skills.clone(),
             bundle: stored.spec.bundle.clone(),
+            settings: stored.spec.settings.clone(),
             bundle_digest: stored.spec.bundle_digest.clone(),
             sandbox_overrides: stored.spec.sandbox_overrides.clone(),
             hook_push_enabled: stored.spec.hook_push_enabled,
@@ -2207,7 +2217,6 @@ fn requeue_master_revive_interrupted_jobs_after_reprovision(
     session_id: &str,
     captured_intents: &[crate::db::recovery::AgentRecoveryIntent],
 ) -> Result<usize, CcbdError> {
-    let conn = db.conn();
     if captured_intents.is_empty() {
         tracing::debug!(
             session_id,
@@ -2224,8 +2233,13 @@ fn requeue_master_revive_interrupted_jobs_after_reprovision(
             interrupted_job_id = ?intent.interrupted_job_id,
             "requeueing in-memory captured interrupted job after master revive worker reprovision"
         );
-        requeued +=
-            crate::db::recovery::requeue_interrupted_job_from_captured_intent_sync(&conn, intent)?;
+        requeued += crate::db::recovery::requeue_interrupted_job_from_captured_intent_standalone_sync(
+            db,
+            intent,
+        )?;
+    }
+    if requeued > 0 {
+        crate::db::jobs::notify_runtime_job_changed();
     }
     Ok(requeued)
 }
@@ -4387,6 +4401,7 @@ mod tests {
                     plugins: Vec::new(),
                     skills: Vec::new(),
                     bundle: Vec::new(),
+                    settings: serde_json::Map::new(),
                     bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
@@ -4492,7 +4507,7 @@ mod tests {
             !redispatch_marker.exists(),
             "IdleNoWork master death must not create a re-dispatch marker"
         );
-        assert!(wait_for_session_status(&db, &session_id, "FAILED").await);
+        assert!(wait_for_session_status(&db, &session_id, "CLOSED").await);
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
 
@@ -4546,7 +4561,7 @@ mod tests {
             db.clone(),
             tmux.clone(),
             format!(
-                "printf '%s\n%s\n%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" \"$HOME\" \"$CLAUDE_CONFIG_DIR\" > {}; sleep 5",
+                "printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \"$AH_STATE_DIR\" \"$CCB_SOCKET\" \"$AH_MASTER_ROLE\" \"$AH_REDISPATCH_MARKER\" \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$AH_ROLE\" \"$AH_SESSION_ID\" \"${{AH_AGENT_ID:-}}\" > {}; sleep 5",
                 env_capture.display()
             ),
             state_dir.clone(),
@@ -4577,6 +4592,9 @@ mod tests {
             expected_home.join(".claude").display().to_string(),
             "revived master CLAUDE_CONFIG_DIR must point at its sandbox .claude"
         );
+        assert_eq!(env_lines[6], "master");
+        assert_eq!(env_lines[7], session_id);
+        assert_eq!(env_lines[8], "");
         assert!(redispatch_marker.exists());
         let _ = tmux.kill_session(master_session_name(&project_id)).await;
     }
@@ -4706,6 +4724,7 @@ mod tests {
                     plugins: Vec::new(),
                     skills: Vec::new(),
                     bundle: Vec::new(),
+                    settings: serde_json::Map::new(),
                     bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
@@ -4814,6 +4833,7 @@ mod tests {
                     plugins: Vec::new(),
                     skills: Vec::new(),
                     bundle: Vec::new(),
+                    settings: serde_json::Map::new(),
                     bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
@@ -4942,6 +4962,7 @@ mod tests {
                     plugins: Vec::new(),
                     skills: Vec::new(),
                     bundle: Vec::new(),
+                    settings: serde_json::Map::new(),
                     bundle_digest: None,
                     sandbox_overrides: Default::default(),
                     hook_push_enabled: false,
@@ -5000,6 +5021,7 @@ mod tests {
         let stale_entry = crate::agent_io::AgentIoEntry {
             session_id: session_id.clone(),
             pane_id: TmuxPaneId("%999999".to_string()),
+            expected_pid: None,
             reader_handle: tokio::spawn(async {}),
             fifo_path: state_dir.join("pipes").join("stale-pane-test.fifo"),
             socket_name: tmux.socket_name().to_string(),
