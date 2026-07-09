@@ -25,7 +25,16 @@ That is all you need — see [Quick Start](#quick-start) below. (Building from s
 | Linux x86_64 — native, or **Windows via WSL2** (see below) | `ah` supervises processes with Linux pidfd and manages lifecycles with systemd | `uname -m` → `x86_64` |
 | `tmux` | every agent runs in its own tmux-backed workspace | `tmux -V` |
 | systemd with a user session | agent process trees run in systemd user scopes, so crashed daemons never leak orphans | `systemctl --user is-system-running` |
-| The provider CLIs you configure | `ah` orchestrates them, it does not bundle them — install and log in to `claude` / `codex` / `antigravity` yourself first | e.g. `claude --version` |
+| The provider CLIs you configure | `ah` orchestrates them, it does not bundle them — install and log in to the provider CLIs yourself first | see table below |
+
+Provider names in `ah.toml` do not always match the binary they launch — check the binary, not the provider name:
+
+| Provider name in `ah.toml` | Binary `ah` launches | Verify with |
+|---|---|---|
+| `claude` | `claude` | `claude --version` |
+| `codex` | `codex` | `codex --version` |
+| `antigravity` (alias: `gemini`) | **`agy`** | `agy --version` |
+| `bash` | `bash` | built-in, nothing to install |
 
 macOS is not supported yet; native support (kqueue-based supervision) is on the roadmap.
 
@@ -246,7 +255,7 @@ Master fields:
 ```toml
 [master]
 enabled = true
-cmd = "claude --dangerously-skip-permissions --continue /remote-control"
+cmd = "claude"
 readiness_timeout_s = 120
 plugins = []
 ```
@@ -254,7 +263,7 @@ plugins = []
 | Field | Type | Notes |
 |---|---|---|
 | `enabled` | bool | Defaults to `true`. |
-| `cmd` | string | Defaults to `claude --dangerously-skip-permissions --continue /remote-control`. Empty string normalizes to `claude`. |
+| `cmd` | string | Defaults to `claude`. Empty string normalizes to `claude`. |
 | `provider` | optional string | Present in config parsing, but v1 master spawning still uses Claude for the sandbox rules path. |
 | `readiness_timeout_s` | integer | Defaults to `120`. |
 | `hooks` | table | Optional. |
