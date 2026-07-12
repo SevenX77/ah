@@ -1,10 +1,10 @@
 [package]
 name = "ah"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2024"
 authors = ["sevenx"]
 description = "L2 Scheduling Daemon for Agent Hypervisor"
-repository = "https://github.com/SevenX77/ah"
+repository = "https://github.com/SevenX77/ccbd-rust"
 
 [dependencies]
 # 异步运行时
@@ -21,8 +21,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 路径规范解算
 directories = "5.0"
-# session_id 生成 (用于 D §3.2 session.create)
-uuid = { version = "1", features = ["v4"] }
+# session_id 生成 (用于 D §3.2 session.create); v7 = 时间前缀有序 outbox event_id (R1-Q1/Q3)
+uuid = { version = "1", features = ["v4", "v7"] }
 # 系统级原语 (MVP2)
 libc = "0.2"
 # 启动期环境探测
