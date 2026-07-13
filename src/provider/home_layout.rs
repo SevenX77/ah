@@ -19,7 +19,6 @@ use toml::Value as TomlValue;
 
 const WHITELIST: &[&str] = &[".ssh", ".gitconfig", ".git-credentials", ".netrc"];
 const PROVIDER_AUTH_WHITELIST: &[&str] = &[
-    ".claude/.credentials.json",
     ".codex/auth.json",
     ".codex/installation_id",
     ".gemini/antigravity-cli/antigravity-oauth-token",
@@ -101,6 +100,21 @@ pub fn prepare_home_layout(
     )
 }
 
+pub fn prepare_home_layout_with_claude_credentials(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    claude_shared_credentials_dir: Option<&Path>,
+) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_role_and_claude_credentials(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        HomeLayoutRole::Worker,
+        claude_shared_credentials_dir,
+    )
+}
+
 pub fn prepare_home_layout_with_role(
     provider: &str,
     sandbox_dir: &Path,
@@ -114,6 +128,25 @@ pub fn prepare_home_layout_with_role(
         role,
         &ExtensionConfig::default(),
         None,
+    )
+}
+
+pub fn prepare_home_layout_with_role_and_claude_credentials(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
+    claude_shared_credentials_dir: Option<&Path>,
+) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        role,
+        default_rules_slot_id(role),
+        &ExtensionConfig::default(),
+        None,
+        claude_shared_credentials_dir,
     )
 }
 
@@ -145,6 +178,29 @@ pub fn prepare_home_layout_with_extensions_for_slot(
     extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
 ) -> Result<HomeOverrides, CcbdError> {
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
+        provider,
+        sandbox_dir,
+        workspace_path,
+        role,
+        slot_id,
+        extensions,
+        hook_push_ctx,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
+    provider: &str,
+    sandbox_dir: &Path,
+    workspace_path: &Path,
+    role: HomeLayoutRole,
+    slot_id: &str,
+    extensions: &ExtensionConfig,
+    hook_push_ctx: Option<&HookPushContext>,
+    claude_shared_credentials_dir: Option<&Path>,
+) -> Result<HomeOverrides, CcbdError> {
     let source_home = materialization_source_home()?;
     let home_root = sandbox_home_for_sandbox_dir(sandbox_dir)?;
     let workspace_key = workspace_trust_key(workspace_path);
@@ -160,6 +216,7 @@ pub fn prepare_home_layout_with_extensions_for_slot(
             slot_id,
             &extensions,
             hook_push_ctx,
+            claude_shared_credentials_dir,
         ),
         "codex" => prepare_codex_overrides(
             &source_home,
@@ -202,6 +259,7 @@ fn prepare_claude_overrides(
     slot_id: &str,
     extensions: &ExtensionConfig,
     hook_push_ctx: Option<&HookPushContext>,
+    shared_credentials_dir: Option<&Path>,
 ) -> Result<HomeOverrides, CcbdError> {
     let layout = ClaudeHomeLayout::for_home(home_root);
     fs::create_dir_all(&layout.claude_dir)
@@ -239,11 +297,9 @@ fn prepare_claude_overrides(
         &hook_specs,
         &plugins,
     )?;
-    link_credentials(source_home, &layout);
-
     Ok(HomeOverrides {
         home_root: home_root.to_path_buf(),
-        extra_env: home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]),
+        extra_env: claude_home_env(home_root, shared_credentials_dir)?,
     })
 }
 
@@ -655,15 +711,6 @@ fn materialize_trust(
     ensure_claude_workspace_trust(&layout.config_dir_state_path, workspace_key)
 }
 
-fn link_credentials(source_home: &Path, layout: &ClaudeHomeLayout) {
-    let source = source_home.join(".claude/.credentials.json");
-    if !source.is_file() {
-        return;
-    }
-    let target = layout.claude_dir.join(".credentials.json");
-    symlink_auth_file(&source, &target);
-}
-
 #[derive(Debug, Clone)]
 struct MaterializedHook {
     event: String,
@@ -676,9 +723,7 @@ pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
     let hook_debug_log = hook_debug_log_path(ctx)
         .map(|path| format!(" --hook-debug-log {}", path.display()))
         .unwrap_or_default();
-    let ah_bin = std::env::current_exe()
-        .map(|exe| resolve_ah_binary(&exe))
-        .unwrap_or_else(|_| "ah".to_string());
+    let ah_bin = resolve_current_ah_binary();
     HookItem {
         hook_type: "command".to_string(),
         command: format!(
@@ -693,14 +738,38 @@ pub fn build_ah_hook_command(ctx: &HookPushContext, event: &str) -> HookItem {
 /// in an environment that does not inherit `PATH`, where a bare `ah` silently
 /// returns 127. When an `ah` binary sits next to the current executable, return
 /// its absolute path; otherwise fall back to the bare `ah` command.
-fn resolve_ah_binary(current_exe: &Path) -> String {
+pub(crate) fn resolve_ah_binary(current_exe: &Path) -> String {
+    resolve_ah_binary_strict(current_exe)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "ah".to_string())
+}
+
+pub(crate) fn resolve_current_ah_binary() -> String {
+    std::env::current_exe()
+        .map(|exe| resolve_ah_binary(&exe))
+        .unwrap_or_else(|_| "ah".to_string())
+}
+
+/// Resolve the sibling `ah` binary without falling back to PATH.
+pub(crate) fn resolve_ah_binary_strict(current_exe: &Path) -> Option<PathBuf> {
     if let Some(dir) = current_exe.parent() {
         let candidate = dir.join("ah");
         if candidate.is_file() {
-            return candidate.display().to_string();
+            return Some(candidate);
         }
     }
-    "ah".to_string()
+    None
+}
+
+pub(crate) fn resolve_current_ah_binary_strict() -> Result<PathBuf, String> {
+    let current_exe =
+        std::env::current_exe().map_err(|err| format!("cannot read current executable: {err}"))?;
+    resolve_ah_binary_strict(&current_exe).ok_or_else(|| {
+        format!(
+            "cannot resolve ah binary next to ahd: no sibling ah beside {}",
+            current_exe.display()
+        )
+    })
 }
 
 fn hook_timeout_for_provider(provider: &str) -> u64 {
@@ -1740,6 +1809,63 @@ fn home_env<const N: usize>(
     env
 }
 
+pub(crate) fn validate_claude_shared_credentials_dir(path: &Path) -> Result<PathBuf, CcbdError> {
+    if path.as_os_str().is_empty() || path.as_os_str().to_string_lossy().trim().is_empty() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: "providers.claude.shared_credentials_dir must be non-empty".into(),
+        });
+    }
+    if !path.is_absolute() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir must be absolute: {}",
+                path.display()
+            ),
+        });
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir is not usable: {}: {err}",
+                path.display()
+            ),
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir must not be a symlink: {}",
+                path.display()
+            ),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(CcbdError::EnvironmentNotSupported {
+            details: format!(
+                "providers.claude.shared_credentials_dir must be a directory: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(path.to_path_buf())
+}
+
+fn claude_home_env(
+    home_root: &Path,
+    shared_credentials_dir: Option<&Path>,
+) -> Result<HashMap<String, String>, CcbdError> {
+    let mut env = home_env(home_root, [("CLAUDE_CONFIG_DIR", ".claude")]);
+    let shared_credentials_dir =
+        shared_credentials_dir.ok_or_else(|| CcbdError::EnvironmentNotSupported {
+            details: "providers.claude.shared_credentials_dir is required for Claude".into(),
+        })?;
+    let shared_credentials_dir = validate_claude_shared_credentials_dir(shared_credentials_dir)?;
+    env.insert(
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_string(),
+        shared_credentials_dir.display().to_string(),
+    );
+    Ok(env)
+}
+
 fn ensure_trust_file(path: &Path) -> Result<(), CcbdError> {
     if path.exists() {
         return Ok(());
@@ -1875,31 +2001,6 @@ fn copy_if_missing(source: &Path, target: &Path) {
         return;
     }
     let _ = fs::copy(source, target);
-}
-
-fn symlink_auth_file(source: &Path, target: &Path) {
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    if target.is_symlink() || target.is_file() {
-        let _ = fs::remove_file(target);
-    } else if target.exists() {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        if let Err(err) = std::os::unix::fs::symlink(source, target) {
-            tracing::warn!(
-                source = %source.display(),
-                target = %target.display(),
-                %err,
-                "failed to symlink provider auth file"
-            );
-        }
-    }
 }
 
 fn symlink_auth_file_checked(source: &Path, target: &Path) -> Result<(), std::io::Error> {
@@ -2372,6 +2473,7 @@ mod tests {
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
         let ctx = HookPushContext {
             agent_id: "master:s_test:7".to_string(),
             provider: "claude".to_string(),
@@ -2388,6 +2490,7 @@ mod tests {
             "master",
             &crate::provider::extensions::ExtensionConfig::default(),
             Some(&ctx),
+            Some(shared.path()),
         )
         .unwrap();
 
@@ -2456,6 +2559,7 @@ mod tests {
 
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
 
         std::fs::write(source.path().join(".claude.json"), "{}").unwrap();
 
@@ -2469,12 +2573,93 @@ mod tests {
             "worker",
             &ExtensionConfig::default(),
             None,
+            Some(shared.path()),
         )
         .unwrap();
 
         let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
         assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
         assert_eq!(settings["permissions"]["defaultMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn claude_home_env_uses_shared_secure_storage_dir() {
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides, read_json_object};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
+        std::fs::write(source.path().join(".claude.json"), "{}").unwrap();
+
+        let overrides = prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            workspace.path(),
+            HomeLayoutRole::Worker,
+            "worker",
+            &ExtensionConfig::default(),
+            None,
+            Some(shared.path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            overrides.extra_env.get("HOME").map(String::as_str),
+            Some(target.path().to_str().unwrap())
+        );
+        assert_eq!(
+            overrides
+                .extra_env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some(target.path().join(".claude").to_str().unwrap())
+        );
+        assert_eq!(
+            overrides
+                .extra_env
+                .get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+                .map(String::as_str),
+            Some(shared.path().to_str().unwrap())
+        );
+        assert!(!overrides.extra_env.contains_key("CLAUDE_CODE_USE_GATEWAY"));
+        assert!(!overrides.extra_env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!target.path().join(".claude/.credentials.json").exists());
+
+        let settings = read_json_object(&target.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_shared_credentials_dir_rejects_symlink_path() {
+        use super::{ExtensionConfig, HomeLayoutRole, prepare_claude_overrides};
+        use tempfile::TempDir;
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("claude-link");
+        std::os::unix::fs::symlink(shared.path(), &link).unwrap();
+
+        let err = prepare_claude_overrides(
+            source.path(),
+            target.path(),
+            &workspace.path().display().to_string(),
+            workspace.path(),
+            HomeLayoutRole::Worker,
+            "worker",
+            &ExtensionConfig::default(),
+            None,
+            Some(&link),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("must not be a symlink"));
     }
 
     #[test]
@@ -2486,6 +2671,7 @@ mod tests {
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
         let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
         let target_claude = target.path().join(".claude");
         std::fs::create_dir_all(&target_claude).unwrap();
         std::fs::write(
@@ -2518,6 +2704,7 @@ mod tests {
             "master",
             &extensions,
             None,
+            Some(shared.path()),
         )
         .unwrap();
 
@@ -2539,6 +2726,7 @@ mod tests {
 
         let source = TempDir::new().unwrap();
         let target = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
 
         std::fs::write(
             source.path().join(".claude.json"),
@@ -2556,6 +2744,7 @@ mod tests {
             "worker",
             &ExtensionConfig::default(),
             None,
+            Some(shared.path()),
         )
         .unwrap();
 
@@ -2819,5 +3008,32 @@ mod tests {
         let exe = dir.path().join("ahd");
 
         assert_eq!(resolve_ah_binary(&exe), "ah");
+    }
+
+    #[test]
+    fn resolve_ah_binary_strict_prefers_sibling_absolute_path() {
+        use super::resolve_ah_binary_strict;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let ah_path = dir.path().join("ah");
+        std::fs::write(&ah_path, b"#!/bin/sh\n").unwrap();
+        let exe = dir.path().join("ahd");
+
+        let resolved = resolve_ah_binary_strict(&exe).unwrap();
+
+        assert_eq!(resolved, ah_path);
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn resolve_ah_binary_strict_returns_none_when_absent() {
+        use super::resolve_ah_binary_strict;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let exe = dir.path().join("ahd");
+
+        assert_eq!(resolve_ah_binary_strict(&exe), None);
     }
 }

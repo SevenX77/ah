@@ -20,7 +20,7 @@ use crate::provider::bundles::{BundleRole, resolve_bundles_for_provider};
 use crate::provider::fingerprint::{ConfigFingerprintInput, ConfigRole, compute_config_hash};
 use crate::provider::home_layout::{
     HomeLayoutRole, HookPushContext, is_ccb_sandbox_home,
-    prepare_home_layout_with_extensions_for_slot,
+    prepare_home_layout_with_extensions_for_slot_and_claude_credentials,
 };
 use crate::provider::manifest::compute_recovery_args;
 use crate::rpc::Ctx;
@@ -106,13 +106,12 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
     // SERVER-SIDE, so both spawn and realign build the fingerprinted env through the
     // same helper. Clients no longer pre-merge (which is what let the two sides diverge).
     let config_env = match params.get("config_env") {
-        Some(value) => {
-            serde_json::from_value::<HashMap<String, String>>(value.clone()).map_err(|err| {
-                CcbdError::IpcInvalidRequest(format!("invalid config_env: {err}"))
-            })?
-        }
+        Some(value) => serde_json::from_value::<HashMap<String, String>>(value.clone())
+            .map_err(|err| CcbdError::IpcInvalidRequest(format!("invalid config_env: {err}")))?,
         None => HashMap::new(),
     };
+    let mut claude_shared_credentials_dir =
+        super::sessions::optional_pathbuf(&params, "claude_shared_credentials_dir")?;
     let sandbox_overrides = match params.get("sandbox_overrides") {
         Some(value) => {
             serde_json::from_value::<SandboxOverrides>(value.clone()).map_err(|err| {
@@ -133,6 +132,9 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             CcbdError::DbConstraintViolation(format!("session not found: {session_id}"))
         })?;
     let agent_cwd: std::path::PathBuf = session.absolute_path.clone().into();
+    if manifest.provider_name == "claude" && claude_shared_credentials_dir.is_none() {
+        claude_shared_credentials_dir = load_claude_shared_credentials_dir(&agent_cwd)?;
+    }
     let resolved_bundles = resolve_bundles_for_provider(
         &agent_cwd,
         manifest.provider_name,
@@ -172,7 +174,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             ahd_socket_path: ctx.state_dir.join("ahd.sock"),
             enabled: hook_push_enabled,
         };
-        let home_overrides = prepare_home_layout_with_extensions_for_slot(
+        let home_overrides = prepare_home_layout_with_extensions_for_slot_and_claude_credentials(
             manifest.provider_name,
             dir,
             &agent_cwd,
@@ -180,12 +182,16 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             agent_id,
             &extensions,
             Some(&hook_push_ctx),
+            claude_shared_credentials_dir.as_deref(),
         )?;
         if is_recovery {
             recovery_args =
                 compute_recovery_args(manifest.provider_name, &home_overrides.home_root);
         }
         spawn_env_vars.extend(home_overrides.extra_env);
+        if manifest.provider_name == "claude" {
+            super::sessions::strip_claude_gateway_env(&mut spawn_env_vars);
+        }
         inject_is_sandbox_env_if_needed(
             manifest.provider_name,
             &manifest.command,
@@ -404,12 +410,15 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
         let matcher = Arc::new(MarkerMatcher::from_manifest(&manifest));
         parser_registry::register(agent_id.to_string(), parser_handle.clone());
         let idle_scan_enabled = Arc::new(AtomicBool::new(false));
-        let reader_handle = crate::agent_io::spawn_agent_io_reader_task_with_config(
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(128);
+        let reader_handle =
+            crate::agent_io::spawn_agent_io_reader_task(agent_id.to_string(), fifo_file, output_tx);
+        crate::marker::spawn_perception_stream_processor_task(
             agent_id.to_string(),
-            fifo_file,
             ctx.db.clone(),
             parser_handle.clone(),
-            crate::agent_io::ReaderMarkerConfig {
+            output_rx,
+            crate::marker::PerceptionStreamConfig {
                 matcher: matcher.clone(),
                 stability_ms: manifest.stability_ms,
                 idle_scan_enabled: idle_scan_enabled.clone(),
@@ -435,6 +444,7 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
             pid,
             pidfd_for_task,
             Arc::new(ctx.db.clone()),
+            Some(ctx.claude_gateway.clone()),
         );
         crate::provider::init_probe_task::spawn_init_probe_task(
             agent_id.to_string(),
@@ -453,6 +463,22 @@ pub(crate) async fn handle_agent_spawn_with_db_action(
 
         Ok(json!({ "state": "SPAWNING", "pid": pid, "pane_id": response_pane_id }))
     }
+}
+
+fn load_claude_shared_credentials_dir(
+    project_root: &Path,
+) -> Result<Option<std::path::PathBuf>, CcbdError> {
+    let config_path = crate::cli::config::find_config(project_root).map_err(|err| {
+        CcbdError::EnvironmentNotSupported {
+            details: format!("load Claude shared credentials config: {err}"),
+        }
+    })?;
+    let config = crate::cli::config::load_project_config(&config_path).map_err(|err| {
+        CcbdError::EnvironmentNotSupported {
+            details: format!("load Claude shared credentials config: {err}"),
+        }
+    })?;
+    Ok(config.providers.claude.shared_credentials_dir)
 }
 
 pub(crate) fn hook_push_enabled_from_spawn_params(params: &Value) -> bool {
@@ -830,6 +856,7 @@ pub async fn handle_agent_kill(params: Value, ctx: &Ctx) -> Result<Value, CcbdEr
     } else {
         tracing::warn!(agent_id, "agent.kill found no pid in database");
     }
+    ctx.claude_gateway.deregister(agent_id).await;
     remove_agent_sandbox_dir_sync(&ctx.state_dir, &agent.session_id, agent_id);
 
     Ok(json!({ "state": "KILLED" }))

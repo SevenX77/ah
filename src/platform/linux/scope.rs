@@ -5,6 +5,7 @@ use crate::sandbox::{EnvState, SandboxOverrides};
 use crate::tmux::scope::{ScopePolicy, UnitConfig};
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,7 +299,14 @@ pub fn master_command(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
 ) -> Vec<String> {
-    master_command_with_env(project_id, cmd, env_state, daemon_unit, &HashMap::new())
+    master_command_with_env(
+        project_id,
+        cmd,
+        env_state,
+        daemon_unit,
+        &HashMap::new(),
+        &SandboxOverrides::default(),
+    )
 }
 
 pub fn master_command_with_env(
@@ -307,6 +315,7 @@ pub fn master_command_with_env(
     env_state: &EnvState,
     daemon_unit: Option<&str>,
     extra_env_vars: &HashMap<String, String>,
+    sandbox_overrides: &SandboxOverrides,
 ) -> Vec<String> {
     if env_state.unsafe_no_sandbox || !env_state.systemd_run_available {
         return shell_command_with_env_prefix(cmd, extra_env_vars);
@@ -325,6 +334,7 @@ pub fn master_command_with_env(
         ));
         append_daemon_unit_dependencies(&mut command, daemon_unit);
     }
+    append_read_only_bind_overrides(&mut command, sandbox_overrides);
     command.push("--".to_string());
     command.extend(master_shell_command_with_env_prefix(cmd, extra_env_vars));
     command
@@ -339,6 +349,12 @@ fn append_daemon_unit_dependencies(cmd: &mut Vec<String>, daemon_unit: Option<&s
 }
 
 fn append_read_only_bind_overrides(cmd: &mut Vec<String>, overrides: &SandboxOverrides) {
+    for bind in &overrides.extra_binds {
+        cmd.push(format!(
+            "--property=BindPaths={}:{}",
+            bind.host_path, bind.sandbox_path
+        ));
+    }
     for bind in &overrides.extra_ro_binds {
         cmd.push(format!(
             "--property=BindReadOnlyPaths={}:{}",
@@ -406,7 +422,68 @@ fn command_with_env_prefix(
             cmd.extend(recovery.args.iter().cloned());
         }
     }
+    if manifest.provider_name == "claude"
+        && extra_env_vars
+            .get("CLAUDE_CODE_USE_GATEWAY")
+            .map(String::as_str)
+            == Some("1")
+        && let Some(shell) = claude_gateway_bridge_shell(&cmd.join(" "), extra_env_vars, None)
+    {
+        return vec!["sh".to_string(), "-lc".to_string(), shell];
+    }
     cmd
+}
+
+fn claude_gateway_bind_context(extra_env_vars: &HashMap<String, String>) -> Option<PathBuf> {
+    let sandbox_root = extra_env_vars.get(crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV)?;
+    Some(PathBuf::from(sandbox_root))
+}
+
+fn claude_gateway_bridge_shell(
+    inner: &str,
+    extra_env_vars: &HashMap<String, String>,
+    ah_bin: Option<&Path>,
+) -> Option<String> {
+    claude_gateway_bridge_shell_with_ah_resolver(inner, extra_env_vars, ah_bin, || {
+        crate::provider::home_layout::resolve_current_ah_binary_strict()
+    })
+}
+
+#[cfg(test)]
+fn claude_gateway_bridge_shell_for_exe_path(
+    inner: &str,
+    extra_env_vars: &HashMap<String, String>,
+    current_exe: &Path,
+) -> Option<String> {
+    claude_gateway_bridge_shell_with_ah_resolver(inner, extra_env_vars, None, || {
+        crate::provider::home_layout::resolve_ah_binary_strict(current_exe).ok_or_else(|| {
+            format!(
+                "cannot resolve ah binary next to ahd: no sibling ah beside {}",
+                current_exe.display()
+            )
+        })
+    })
+}
+
+fn claude_gateway_bridge_shell_with_ah_resolver(
+    inner: &str,
+    extra_env_vars: &HashMap<String, String>,
+    ah_bin: Option<&Path>,
+    resolve_ah_bin: impl FnOnce() -> Result<PathBuf, String>,
+) -> Option<String> {
+    let sandbox_root = claude_gateway_bind_context(extra_env_vars)?;
+    let ah_bin = ah_bin
+        .map(Path::to_path_buf)
+        .map_or_else(resolve_ah_bin, Ok);
+    Some(match ah_bin {
+        Ok(ah_bin) => crate::claude_gateway::bridge_wrapper_shell(
+            inner,
+            &ah_bin,
+            Path::new(crate::claude_gateway::SANDBOX_UDS_PATH),
+            &sandbox_root,
+        ),
+        Err(err) => format!("echo {} >&2; exit 126", shell_quote(&err)),
+    })
 }
 
 fn shell_command_with_env_prefix(
@@ -432,6 +509,10 @@ fn shell_command_with_env_prefix(
     cmd
 }
 
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
+}
+
 fn master_shell_command_with_env_prefix(
     shell_cmd: &str,
     extra_env_vars: &HashMap<String, String>,
@@ -451,12 +532,22 @@ fn master_shell_command_with_env_prefix(
         env_entries.sort();
         cmd.extend(env_entries);
     }
+    let command = if extra_env_vars
+        .get("CLAUDE_CODE_USE_GATEWAY")
+        .map(String::as_str)
+        == Some("1")
+        && let Some(command) = claude_gateway_bridge_shell(shell_cmd, extra_env_vars, None)
+    {
+        command
+    } else {
+        shell_cmd.to_string()
+    };
     cmd.extend([
         "sh".to_string(),
         "-lc".to_string(),
         "echo 500 > /proc/self/oom_score_adj 2>/dev/null || { echo 'ccbd master failed to set oom_score_adj=500' >&2; exit 126; }; exec sh -lc \"$1\"".to_string(),
         "sh".to_string(),
-        shell_cmd.to_string(),
+        command,
     ]);
     cmd
 }
@@ -465,9 +556,11 @@ fn master_shell_command_with_env_prefix(
 mod tests {
     use super::{
         ScopeUnit, SystemctlRunner, active_daemon_unit_or_none_with_runner,
+        claude_gateway_bridge_shell, claude_gateway_bridge_shell_for_exe_path,
         detect_scope_policy_with_daemon_unit, wrap_in_scope,
     };
     use std::io;
+    use std::process::Command;
 
     struct UnitActiveRunner {
         active: bool,
@@ -492,6 +585,37 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn fake_bridge_ah(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake-ah");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+port_file=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --port-file)
+      port_file="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf '45678' > "$port_file"
+sleep 1
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
     }
 
     #[test]
@@ -531,10 +655,138 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_command_scrubs_inherited_env_master() {
+    #[cfg(unix)]
+    fn claude_gateway_wrapper_uses_explicit_sandbox_root_not_short_uds_parent() {
         use std::collections::HashMap;
-        use crate::platform::sys::scope::master_command_with_env;
+
+        let tools = tempfile::tempdir().unwrap();
+        let fake_ah = fake_bridge_ah(tools.path());
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let out_a = root_a.path().join("inner.out");
+        let out_b = root_b.path().join("inner.out");
+
+        let mut env_a = HashMap::new();
+        env_a.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        env_a.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            "/tmp/ah-gw-worker-a.sock".to_string(),
+        );
+        env_a.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            root_a.path().display().to_string(),
+        );
+        let mut env_b = env_a.clone();
+        env_b.insert(
+            "AH_CLAUDE_GATEWAY_HOST_UDS".to_string(),
+            "/tmp/ah-gw-worker-b.sock".to_string(),
+        );
+        env_b.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            root_b.path().display().to_string(),
+        );
+
+        let shell_a = claude_gateway_bridge_shell(
+            &format!("printf '%s' \"$ANTHROPIC_BASE_URL\" > {}", out_a.display()),
+            &env_a,
+            Some(&fake_ah),
+        )
+        .unwrap();
+        let shell_b = claude_gateway_bridge_shell(
+            &format!("printf '%s' \"$ANTHROPIC_BASE_URL\" > {}", out_b.display()),
+            &env_b,
+            Some(&fake_ah),
+        )
+        .unwrap();
+
+        assert!(shell_a.contains(&root_a.path().join("bridge.port").display().to_string()));
+        assert!(shell_a.contains(&root_a.path().join("bridge.err").display().to_string()));
+        assert!(!shell_a.contains("rm -f /bridge.port;"));
+        assert!(shell_b.contains(&root_b.path().join("bridge.port").display().to_string()));
+        assert!(shell_b.contains(&root_b.path().join("bridge.err").display().to_string()));
+        assert!(!shell_b.contains("rm -f /bridge.port;"));
+
+        let status_a = Command::new("sh").args(["-lc", &shell_a]).status().unwrap();
+        let status_b = Command::new("sh").args(["-lc", &shell_b]).status().unwrap();
+        assert!(status_a.success());
+        assert!(status_b.success());
+
+        assert_eq!(
+            std::fs::read_to_string(root_a.path().join("bridge.port")).unwrap(),
+            "45678"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root_b.path().join("bridge.port")).unwrap(),
+            "45678"
+        );
+        assert!(root_a.path().join("bridge.err").exists());
+        assert!(root_b.path().join("bridge.err").exists());
+        assert_ne!(
+            root_a.path().join("bridge.port"),
+            root_b.path().join("bridge.port")
+        );
+        assert_eq!(
+            std::fs::read_to_string(out_a).unwrap(),
+            "http://localhost:45678"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out_b).unwrap(),
+            "http://localhost:45678"
+        );
+    }
+
+    #[test]
+    fn claude_gateway_wrapper_resolves_sibling_ah_when_not_injected() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ah_path = dir.path().join("ah");
+        std::fs::write(&ah_path, b"#!/bin/sh\n").unwrap();
+        let current_exe = dir.path().join("ahd");
+        let sandbox_root = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        let mut extra_env = HashMap::new();
+        extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        extra_env.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            sandbox_root.display().to_string(),
+        );
+
+        let shell =
+            claude_gateway_bridge_shell_for_exe_path("claude", &extra_env, &current_exe).unwrap();
+
+        assert!(shell.contains(&format!("'{}'", ah_path.display())));
+        assert!(!shell.contains(&format!("'{}'", current_exe.display())));
+    }
+
+    #[test]
+    fn claude_gateway_wrapper_fails_closed_when_sibling_ah_is_absent() {
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current_exe = dir.path().join("ahd");
+        let sandbox_root = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+        let mut extra_env = HashMap::new();
+        extra_env.insert("CLAUDE_CODE_USE_GATEWAY".to_string(), "1".to_string());
+        extra_env.insert(
+            crate::claude_gateway::GATEWAY_SANDBOX_ROOT_ENV.to_string(),
+            sandbox_root.display().to_string(),
+        );
+
+        let shell =
+            claude_gateway_bridge_shell_for_exe_path("claude", &extra_env, &current_exe).unwrap();
+
+        assert!(shell.contains("cannot resolve ah binary next to ahd"));
+        assert!(shell.contains("exit 126"));
+        assert!(!shell.contains(" ah internal-bridge"));
+    }
+
+    #[test]
+    fn test_spawn_command_scrubs_inherited_env_master() {
         use crate::platform::sys::scope::EnvState;
+        use crate::platform::sys::scope::master_command_with_env;
+        use std::collections::HashMap;
 
         let mut extra_env = HashMap::new();
         crate::process_identity::inject_master_identity(&mut extra_env, "test-session");
@@ -551,6 +803,7 @@ mod tests {
             &env_state,
             None,
             &extra_env,
+            &Default::default(),
         );
 
         // Under no systemd, it falls back to shell_command_with_env_prefix
@@ -566,12 +819,16 @@ mod tests {
 
     #[test]
     fn test_spawn_command_scrubs_inherited_env_worker() {
-        use std::collections::HashMap;
         use crate::platform::sys::scope::wrap_command_with_recovery_and_sandbox_overrides;
         use crate::platform::sys::scope::{EnvState, RecoverySpawn};
+        use std::collections::HashMap;
 
         let mut extra_env = HashMap::new();
-        crate::process_identity::inject_worker_identity(&mut extra_env, "test-session", "test-agent");
+        crate::process_identity::inject_worker_identity(
+            &mut extra_env,
+            "test-session",
+            "test-agent",
+        );
 
         let env_state = EnvState {
             under_systemd: false,
@@ -586,7 +843,10 @@ mod tests {
             "test-project",
             "test-marker",
             &env_state,
-            RecoverySpawn { is_recovery: false, args: vec![] },
+            RecoverySpawn {
+                is_recovery: false,
+                args: vec![],
+            },
             None,
             &manifest,
             &extra_env,
